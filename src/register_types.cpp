@@ -8,6 +8,7 @@
 #include "summator.h"
 #include "traffic_light.h"
 #include "my_player.h"
+#include "OpenCVProcessor.h"
 
 using namespace godot;
 
@@ -19,6 +20,7 @@ void initialize_gdextension_types(ModuleInitializationLevel p_level)
 	GDREGISTER_CLASS(Summator);
 	GDREGISTER_CLASS(TrafficLight);
 	GDREGISTER_RUNTIME_CLASS(MyPlayer);
+	GDREGISTER_CLASS(OpenCVProcessor);
 }
 
 void uninitialize_gdextension_types(ModuleInitializationLevel p_level) {

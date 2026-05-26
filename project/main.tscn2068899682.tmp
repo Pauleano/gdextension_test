@@ -1,0 +1,45 @@
+[gd_scene format=3 uid="uid://dh0oj81pufivs"]
+
+[ext_resource type="Script" uid="uid://bkwk40ybs8kgm" path="res://main.gd" id="1_ig7tw"]
+[ext_resource type="Texture2D" uid="uid://uvgknfpndy" path="res://assets/go.png" id="2_1bvp3"]
+[ext_resource type="Texture2D" uid="uid://c7p6466tql3td" path="res://assets/stop.png" id="3_lquwl"]
+[ext_resource type="Texture2D" uid="uid://b8sn4nk85m8n1" path="res://assets/caution.png" id="4_7mycd"]
+[ext_resource type="Script" uid="uid://qdv41n4dnb1o" path="res://traffic_light.gd" id="5_lquwl"]
+[ext_resource type="Texture2D" uid="uid://dbx66sovxd1" path="res://icon.svg" id="6_7mycd"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_7mycd"]
+
+[node name="Main" type="Node2D" unique_id=285586139]
+script = ExtResource("1_ig7tw")
+
+[node name="TrafficLight" type="TrafficLight" parent="." unique_id=1555705115]
+go_texture = ExtResource("2_1bvp3")
+stop_texture = ExtResource("3_lquwl")
+caution_texture = ExtResource("4_7mycd")
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_right = 500.0
+offset_bottom = 500.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("5_lquwl")
+
+[node name="Button" type="Button" parent="." unique_id=897238214]
+offset_left = 701.0
+offset_top = 21.0
+offset_right = 746.0
+offset_bottom = 52.0
+text = "Next
+"
+
+[node name="MyPlayer" type="MyPlayer" parent="." unique_id=651936081]
+
+[node name="Sprite2D" type="Sprite2D" parent="MyPlayer" unique_id=107998381]
+texture = ExtResource("6_7mycd")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="MyPlayer" unique_id=1516789108]
+shape = SubResource("RectangleShape2D_7mycd")
+
+[connection signal="light_changed" from="TrafficLight" to="." method="_on_traffic_light_light_changed"]
+[connection signal="pressed" from="Button" to="." method="_on_button_pressed"]

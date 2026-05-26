@@ -37,28 +37,69 @@ Run the following command to download godot-cpp:
 
 env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs})
 
-env.Append(CPPPATH=["src/"])
+opencv_header_files = [
+    "opencv/build/install/include",
+]
+
+opencv_library_files = {
+    'windows': [
+        'opencv_world4140.lib',
+    ],
+    'macos': [
+        'libopencv_core.dylib',
+        'libopencv_imgcodecs.dylib',
+        'libopencv_imgproc.dylib',
+        'libopencv_videoio.dylib',
+        'libopencv_objdetect.dylib',
+        'libopencv_video.dylib',
+        'libopencv_tracking.dylib'
+    ],
+    'linux': [
+        'libopencv_core.so',
+        'libopencv_imgcodecs.so',
+        'libopencv_imgproc.so',
+        'libopencv_videoio.so',
+        'libopencv_objdetect.so',
+        'libopencv_video.so',
+        'libopencv_tracking.so'
+    ]
+}
+
+opencv_library_path = {
+    'windows': ['opencv/build/install/x64/vc17/lib'],
+    'macos':   ['opencv/build/install/lib'],
+    'linux':   ['opencv/build/install/lib'],
+}
+
+env.Append(CPPPATH=opencv_header_files)
+env.Append(LIBPATH=opencv_library_path[env["platform"]])
+env.Append(LIBS=opencv_library_files[env["platform"]])
+
+
 sources = Glob("src/*.cpp")
 
-if env["target"] in ["editor", "template_debug"]:
-    try:
-        doc_data = env.GodotCPPDocData("src/gen/doc_data.gen.cpp", source=Glob("doc_classes/*.xml"))
-        sources.append(doc_data)
-    except AttributeError:
-        print("Not including class reference as we're targeting a pre-4.3 baseline.")
+# Create SharedLibrary
 
-# .dev doesn't inhibit compatibility, so we don't need to key it.
-# .universal just means "compatible with all relevant arches" so we don't need to key it.
-suffix = env['suffix'].replace(".dev", "").replace(".universal", "")
+if env["platform"] == "macos":
+    library = env.SharedLibrary(
+        "demo/bin/godotopencvextension.{}.{}.framework/godotopencvextension.{}.{}".format(
+            env["platform"], env["target"], env["platform"], env["target"]
+        ),
+        source=sources,
+    )
+else:
+    library = env.SharedLibrary(
+        "{}/bin/{}/{}{}{}".format(
+            projectdir, env["platform"], libname, env["suffix"], env["SHLIBSUFFIX"]
+        ),
+        source=sources,
+    )
 
-lib_filename = "{}{}{}{}".format(env.subst('$SHLIBPREFIX'), libname, suffix, env.subst('$SHLIBSUFFIX'))
+opencv_runtime = []
+if env["platform"] == "windows":
+    opencv_runtime = env.Install(
+        "{}/bin/{}".format(projectdir, env["platform"]),
+        "opencv/build/install/x64/vc17/bin/opencv_world4140.dll",
+    )
 
-library = env.SharedLibrary(
-    "bin/{}/{}".format(env['platform'], lib_filename),
-    source=sources,
-)
-
-copy = env.Install("{}/bin/{}/".format(projectdir, env["platform"]), library)
-
-default_args = [library, copy]
-Default(*default_args)
+Default(library, opencv_runtime)
