@@ -62,6 +62,7 @@ Transform3D OpenCVProcessor::get_6dof_of_aruco_patch_from_picture(const String &
 
     //initialise markers corners (oben links, oben rechts, unten rechts, unten links)
     //in this order because we use flag=ippe_square
+    //marker_length is the side length of the marker in meters (passed in from caller)
     float half = 0.05f / 2.0f;
     std::vector<cv::Point3f> obj_pts = {
         {-half,  half, 0.0f},
@@ -114,17 +115,20 @@ Transform3D OpenCVProcessor::get_6dof_of_aruco_patch_from_picture(const String &
     cv::Mat rot_matrix;
     cv::Rodrigues(rvec,rot_matrix);
 
-// Basis-Konvertierung: Y und Z der OpenCV-Matrix flippen (M=diag(1,-1,-1)=M^-1, basiswechsel durch M*rot_mat*M^-1)
+    //first vector is first coloumn
+    //rodrigues outputs in double
+    //vector3 converts to float
+    //with s=diag(1,-1,-1) basis is S*rot_matrix and origin is S*tvec or basis=S*rot_matrix*S and origin is tvec 
     Basis basis(
-        Vector3( rot_matrix.at<double>(0,0), -rot_matrix.at<double>(0,1), -rot_matrix.at<double>(0,2)),
-        Vector3(-rot_matrix.at<double>(1,0),  rot_matrix.at<double>(1,1),  rot_matrix.at<double>(1,2)),
-        Vector3(-rot_matrix.at<double>(2,0),  rot_matrix.at<double>(2,1),  rot_matrix.at<double>(2,2))
+        Vector3(rot_matrix.at<double>(0,0), -rot_matrix.at<double>(1,0), -rot_matrix.at<double>(2,0)),
+        Vector3(-rot_matrix.at<double>(0,1), rot_matrix.at<double>(1,1), rot_matrix.at<double>(2,1)),
+        Vector3(-rot_matrix.at<double>(0,2), rot_matrix.at<double>(1,2), rot_matrix.at<double>(2,2))
     );
 
     Vector3 origin(
-        static_cast<float>( tvec.at<double>(0)),
-        static_cast<float>(-tvec.at<double>(1)),
-        static_cast<float>(-tvec.at<double>(2))
+        ( tvec.at<double>(0)),
+        (tvec.at<double>(1)),
+        (tvec.at<double>(2))
     );
 
     return Transform3D(basis, origin);
