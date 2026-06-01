@@ -23,11 +23,49 @@ To get started with your new GDExtension, do the following:
   * rename the `example_library_init` function in [src/register_types.cpp](./src/register_types.cpp) to the same name you chose for `entry_symbol`.
 * change the name of the `project/bin/example.gdextension` file
 
-Now, you can build the project with the following command:
+Now, you can build the project with a single command:
 
 ```shell
-scons
+git submodule update --init     # godot-cpp bindings
+scons                           # builds OpenCV via Conan automatically, then the extension
 ```
+
+### OpenCV dependency (Conan)
+
+OpenCV is managed as a [Conan](https://conan.io) dependency and **built from source,
+statically linked** into the extension — there is no prebuilt OpenCV binary and no manual
+`opencv/build/install/` setup anymore.
+
+`scons` drives the whole thing automatically (the Conan calls live directly in the
+[`SConstruct`](./SConstruct), the dependency itself in [`conanfile.py`](./conanfile.py)):
+
+* if `conan` is missing it is installed via `pip install --user "conan>=2.0"`,
+* a default Conan profile is created if needed,
+* the Conan settings (os / arch / build_type / MSVC runtime) are derived from the scons build,
+* `conan install` builds OpenCV from source into a per-target folder under `conan_install/`,
+* the SConstruct merges those flags and links OpenCV statically.
+
+The **first** build therefore takes noticeably longer (OpenCV compiles from source, ~10–20 min);
+subsequent builds reuse the local Conan cache and are fast. Requirements stay the same: Python 3,
+a C++ compiler and SCons. To force a fresh resolve, delete the relevant folder under
+`conan_install/` (or touch `conanfile.py`).
+
+#### Platforms
+
+* **macOS / Linux / Windows** (native): just run `scons` (e.g. `scons platform=windows`). The
+  Conan settings are taken from the build automatically. On Windows/MSVC the C++ runtime is
+  matched to godot-cpp (`use_static_cpp` → `/MT` → Conan `compiler.runtime=static`).
+* **Android / iOS / Web** (cross-compile): these need a Conan profile describing the toolchain
+  (e.g. the Android NDK), because the host default profile can't cross-compile OpenCV. Point to
+  it via `CONAN_HOST_PROFILE` (in addition to the usual godot-cpp requirements such as
+  `ANDROID_HOME`/NDK):
+
+  ```shell
+  CONAN_HOST_PROFILE=/path/to/android-profile scons platform=android arch=arm64
+  ```
+
+  Building without such a profile aborts with an explanatory message. See the
+  [Conan profiles docs](https://docs.conan.io/2/reference/config_files/profiles.html).
 
 If the build command worked, you can test it with the [project](./project) project. Import it into Godot, open it, and launch the main scene. You should see it print the following line in the console:
 
