@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 import os
+import platform
+import shutil
+import site
+import subprocess
 import sys
 
 from methods import print_error
@@ -28,6 +32,18 @@ Help(opts.GenerateHelpText(localEnv))
 
 env = localEnv.Clone()
 
+# macOS: standardmaessig fuer die Host-Architektur bauen statt godot-cpps Default
+# "universal". Die OpenCV-Libs baut Conan fuer EINE Architektur (Host); ein universal
+# Extension-Binary wuerde dagegen nicht linken. Ein explizites `arch=...` auf der
+# Kommandozeile hat weiterhin Vorrang.
+if sys.platform == "darwin" and "arch" not in ARGUMENTS:
+    env["arch"] = "arm64" if platform.machine() == "arm64" else "x86_64"
+
+# OpenCV-Header (flann etc.) nutzen C++-Exceptions; godot-cpp deaktiviert sie per
+# Default (-fno-exceptions). Fuer dieses Projekt also Exceptions anlassen. Ein
+# explizites `disable_exceptions=...` auf der Kommandozeile hat weiterhin Vorrang.
+env["disable_exceptions"] = False
+
 if not (os.path.isdir("godot-cpp") and os.listdir("godot-cpp")):
     print_error("""godot-cpp is not available within this folder, as Git submodules haven't been initialized.
 Run the following command to download godot-cpp:
@@ -37,69 +53,130 @@ Run the following command to download godot-cpp:
 
 env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs})
 
-opencv_header_files = [
-    "opencv/build/install/include",
-]
-
-opencv_library_files = {
-    'windows': [
-        'opencv_world4140.lib',
-    ],
-    'macos': [
-        'libopencv_core.dylib',
-        'libopencv_imgcodecs.dylib',
-        'libopencv_imgproc.dylib',
-        'libopencv_videoio.dylib',
-        'libopencv_objdetect.dylib',
-        'libopencv_video.dylib',
-        'libopencv_tracking.dylib'
-    ],
-    'linux': [
-        'libopencv_core.so',
-        'libopencv_imgcodecs.so',
-        'libopencv_imgproc.so',
-        'libopencv_videoio.so',
-        'libopencv_objdetect.so',
-        'libopencv_video.so',
-        'libopencv_tracking.so'
-    ]
-}
-
-opencv_library_path = {
-    'windows': ['opencv/build/install/x64/vc17/lib'],
-    'macos':   ['opencv/build/install/lib'],
-    'linux':   ['opencv/build/install/lib'],
-}
-
-env.Append(CPPPATH=opencv_header_files)
-env.Append(LIBPATH=opencv_library_path[env["platform"]])
-env.Append(LIBS=opencv_library_files[env["platform"]])
-
-
 sources = Glob("src/*.cpp")
 
-# Create SharedLibrary
+# godot-cpp Architektur -> Conan settings.arch
+conan_arch = {
+    "arm64": "armv8", "x86_64": "x86_64", "x86_32": "x86", "arm32": "armv7",
+}.get(env.get("arch"))
 
-if env["platform"] == "macos":
-    library = env.SharedLibrary(
-        "demo/bin/godotopencvextension.{}.{}.framework/godotopencvextension.{}.{}".format(
-            env["platform"], env["target"], env["platform"], env["target"]
-        ),
-        source=sources,
-    )
-else:
-    library = env.SharedLibrary(
-        "{}/bin/{}/{}{}{}".format(
-            projectdir, env["platform"], libname, env["suffix"], env["SHLIBSUFFIX"]
-        ),
-        source=sources,
-    )
 
-opencv_runtime = []
+def ensure_conan():
+    """conan finden, bei Bedarf via pip installieren, Default-Profil sicherstellen.
+    Plattformunabhaengig -- nur das eigentliche `conan install <ziel>` steht je
+    Plattform-Branch (dort dupliziert)."""
+    conan = shutil.which("conan") or os.path.join(site.getuserbase(), "bin", "conan")
+    if not os.path.isfile(conan):
+        print("conan nicht gefunden -- installiere via pip ...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "conan>=2.0"], check=True)
+        conan = os.path.join(site.getuserbase(), "bin", "conan")
+        if not os.path.isfile(conan):
+            print_error("conan installiert, aber nicht gefunden unter: " + conan)
+            sys.exit(1)
+    if subprocess.run([conan, "profile", "path", "default"], capture_output=True).returncode != 0:
+        subprocess.run([conan, "profile", "detect"], check=True)
+    return conan
+
+
+def conan_outdated(env, conan_out):
+    """True, wenn fuer dieses Ziel noch kein aktuelles SConscript_conandeps vorliegt
+    (erster Lauf oder conanfile.py geaendert). Bei `scons -c` nie bauen."""
+    if env.GetOption("clean"):
+        return False
+    conandeps_file = os.path.join(conan_out, "SConscript_conandeps")
+    return not (os.path.isfile(conandeps_file)
+                and os.path.getmtime(conandeps_file) >= os.path.getmtime("conanfile.py"))
+
+
+def merge_conan_deps(env, conan_out):
+    """Conan-Dependency-Flags ins env mergen (plattformunabhaengig)."""
+    conandeps_file = os.path.join(conan_out, "SConscript_conandeps")
+    if os.path.isfile(conandeps_file):
+        flags = SConscript(conandeps_file)["conandeps"]
+        env.MergeFlags(flags)
+        # godot-cpp linkt mit -undefined,dynamic_lookup -> $FRAMEWORKS aus MergeFlags
+        # fallen weg; daher explizit als -framework auf die Linkzeile (macOS videoio).
+        for framework_name in flags.get("FRAMEWORKS", []):
+            env.Append(LINKFLAGS=["-framework", framework_name])
+
+
+# Jede Plattform explizit: der plattformabhaengige `conan install <ziel>` steht hier
+# (dupliziert). conan-Bootstrap (ensure_conan), Frische-Check (conan_outdated) und
+# Flag-Merge (merge_conan_deps) sind ausgelagert, weil plattformunabhaengig.
+# Ausgabe pro Ziel getrennt -> mehrere Plattformen aus EINEM Checkout.
 if env["platform"] == "windows":
-    opencv_runtime = env.Install(
-        "{}/bin/{}".format(projectdir, env["platform"]),
-        "opencv/build/install/x64/vc17/bin/opencv_world4140.dll",
+    conan_out = os.path.join("conan_install", "windows.{}.{}".format(env.get("arch") or "host", env["target"]))
+    if conan_outdated(env, conan_out):
+        settings = ["-s", "build_type=Release", "-s", "compiler.cppstd=17", "-s", "os=Windows"]
+        if conan_arch:
+            settings += ["-s", "arch=" + conan_arch]
+        if not env.get("use_mingw", False):
+            # C++-Runtime an godot-cpp angleichen (use_static_cpp -> /MT), sonst MD/MT-Mismatch.
+            settings += ["-s", "compiler.runtime=" + ("static" if env.get("use_static_cpp", True) else "dynamic")]
+        subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
+                        "--build=missing"] + settings, check=True)
+    merge_conan_deps(env, conan_out)
+    library = env.SharedLibrary(  # snopek_tut.windows.<target>[.double].<arch>.dll (kein "lib")
+        "{}/bin/windows/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
     )
 
-Default(library, opencv_runtime)
+elif env["platform"] == "linux":
+    conan_out = os.path.join("conan_install", "linux.{}.{}".format(env.get("arch") or "host", env["target"]))
+    if conan_outdated(env, conan_out):
+        settings = ["-s", "build_type=Release", "-s", "compiler.cppstd=17", "-s", "os=Linux"]
+        if conan_arch:
+            settings += ["-s", "arch=" + conan_arch]
+        subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
+                        "--build=missing"] + settings, check=True)
+    merge_conan_deps(env, conan_out)
+    library = env.SharedLibrary(  # libsnopek_tut.linux.<target>[.double].<arch>.so
+        "{}/bin/linux/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
+    )
+
+elif env["platform"] == "android":
+    conan_out = os.path.join("conan_install", "android.{}.{}".format(env.get("arch") or "host", env["target"]))
+    if conan_outdated(env, conan_out):
+        # Cross-Build: braucht ein Conan-Toolchain-Profil (NDK) via CONAN_HOST_PROFILE.
+        host_profile = os.environ.get("CONAN_HOST_PROFILE")
+        if not host_profile:
+            print_error(
+                "Cross-Build fuer 'android' braucht ein Conan-Profil (Android-NDK):\n"
+                "    CONAN_HOST_PROFILE=/pfad/zu/android-profil scons platform=android arch=arm64"
+            )
+            sys.exit(1)
+        subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
+                        "--build=missing", "-pr:h", host_profile], check=True)
+    merge_conan_deps(env, conan_out)
+    library = env.SharedLibrary(  # libsnopek_tut.android.<target>[.double].<arch>.so
+        "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
+    )
+
+elif env["platform"] == "macos":
+    conan_out = os.path.join("conan_install", "macos.{}.{}".format(env.get("arch") or "host", env["target"]))
+    if conan_outdated(env, conan_out):
+        settings = ["-s", "build_type=Release", "-s", "compiler.cppstd=17", "-s", "os=Macos"]
+        if conan_arch:
+            settings += ["-s", "arch=" + conan_arch]
+        subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
+                        "--build=missing"] + settings, check=True)
+    merge_conan_deps(env, conan_out)
+    # minimales .framework; SHLIBPREFIX="" -> Binary-Name == Framework-Name (Godot-Anforderung).
+    framework = "{}.macos.{}".format(libname, env["target"])
+    library = env.SharedLibrary(
+        "{}/bin/macos/{}.framework/{}".format(projectdir, framework, framework),
+        source=sources,
+        SHLIBPREFIX="",
+    )
+
+else:
+    print_error(
+        "Nicht unterstuetzte Plattform '{}'. Unterstuetzt: windows, linux, android, macos.".format(
+            env["platform"]
+        )
+    )
+    sys.exit(1)
+
+Default(library)
