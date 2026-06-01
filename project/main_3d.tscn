@@ -8,13 +8,20 @@
 script = ExtResource("1_wiwsh")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=959766979]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0.25)
+
+[node name="aruco_patch0" type="Node3D" parent="Camera3D" unique_id=1968016531]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Camera3D/aruco_patch0" unique_id=297015256]
+transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
+mesh = SubResource("BoxMesh_wiwsh")
+
+[node name="aruco_patch1" type="Node3D" parent="Camera3D" unique_id=603516852]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Camera3D/aruco_patch1" unique_id=656717756]
+transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
+mesh = SubResource("BoxMesh_wiwsh")
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1064034995]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1)
-
-[node name="aruco_patch" type="Node3D" parent="." unique_id=1968016531]
-
-[node name="MeshInstance3D" type="MeshInstance3D" parent="aruco_patch" unique_id=297015256]
-transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
-mesh = SubResource("BoxMesh_wiwsh")
