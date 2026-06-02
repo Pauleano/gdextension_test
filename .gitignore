@@ -48,7 +48,6 @@ compile_commands.json
 
 # Other stuff
 *.log
-*.lock
 
 # VSCode
 .vscode/*
@@ -61,14 +60,3 @@ compile_commands.json
 # Cmake
 cmake-build*
 CMakeUserPresets.json
-
-# Conan (von `scons`/`conan install` generiert)
-conan_install/
-SConscript_conandeps
-conandeps*
-conanbuild*
-conanrun*
-deactivate_conan*
-conaninfo.txt
-conan.lock
-graph_info.json
