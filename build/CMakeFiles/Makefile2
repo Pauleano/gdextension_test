@@ -105,8 +105,8 @@ godot-cpp/clean: godot-cpp/CMakeFiles/godot-cpp.dir/clean
 # Target rules for target CMakeFiles/snopek_tut.dir
 
 # All Build rule for target.
-CMakeFiles/snopek_tut.dir/all: godot-cpp/CMakeFiles/godot-cpp.dir/all
 CMakeFiles/snopek_tut.dir/all: CMakeFiles/generate_doc_source.dir/all
+CMakeFiles/snopek_tut.dir/all: godot-cpp/CMakeFiles/godot-cpp.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\snopek_tut.dir\build.make CMakeFiles/snopek_tut.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\snopek_tut.dir\build.make CMakeFiles/snopek_tut.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir="C:\Users\Paul Geiger\Documents\gdextension_test\gdextension_test\build\CMakeFiles" --progress-num=100 "Built target snopek_tut"

@@ -25,3 +25,13 @@ mesh = SubResource("BoxMesh_wiwsh")
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1064034995]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1)
+
+[node name="CameraLayer" type="CanvasLayer" parent="." unique_id=206553118]
+
+[node name="CameraPreview" type="TextureRect" parent="CameraLayer" unique_id=1073749614]
+custom_minimum_size = Vector2(320, 240)
+offset_right = 320.0
+offset_bottom = 240.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5

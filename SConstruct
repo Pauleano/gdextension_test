@@ -2,9 +2,9 @@
 import os
 import platform
 import shutil
-import site
 import subprocess
 import sys
+import sysconfig
 
 from methods import print_error
 
@@ -61,15 +61,25 @@ conan_arch = {
 }.get(env.get("arch"))
 
 
+def _user_conan_path():
+    """Pfad zum conan-Executable im User-Scripts-Verzeichnis (dort, wo
+    `pip install --user` Scripts ablegt). Plattformabhaengig: Windows nutzt
+    `Scripts\\conan.exe` inkl. Python-Versions-Unterordner, POSIX `.local/bin/conan`."""
+    scheme = "nt_user" if os.name == "nt" else "posix_user"
+    scripts = sysconfig.get_path("scripts", scheme)
+    exe = "conan.exe" if os.name == "nt" else "conan"
+    return os.path.join(scripts, exe)
+
+
 def ensure_conan():
     """conan finden, bei Bedarf via pip installieren, Default-Profil sicherstellen.
     Plattformunabhaengig -- nur das eigentliche `conan install <ziel>` steht je
     Plattform-Branch (dort dupliziert)."""
-    conan = shutil.which("conan") or os.path.join(site.getuserbase(), "bin", "conan")
+    conan = shutil.which("conan") or _user_conan_path()
     if not os.path.isfile(conan):
         print("conan nicht gefunden -- installiere via pip ...")
         subprocess.run([sys.executable, "-m", "pip", "install", "--user", "conan>=2.0"], check=True)
-        conan = os.path.join(site.getuserbase(), "bin", "conan")
+        conan = _user_conan_path()
         if not os.path.isfile(conan):
             print_error("conan installiert, aber nicht gefunden unter: " + conan)
             sys.exit(1)

@@ -62,6 +62,9 @@ compile_commands.json
 cmake-build*
 CMakeUserPresets.json
 
+# OpenCV (lokaler Build-Input, via Conan verwaltet — nicht eingecheckt)
+opencv/
+
 # Conan (von `scons`/`conan install` generiert)
 conan_install/
 SConscript_conandeps
