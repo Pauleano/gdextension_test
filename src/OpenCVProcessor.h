@@ -2,8 +2,10 @@
 #pragma once
 
 #include <godot_cpp/classes/node.hpp>
+#include <godot_cpp/classes/image.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
+#include <opencv2/core.hpp>
 
 using namespace godot;
 
@@ -16,6 +18,9 @@ private:
     //built once in ctor and reused; dictionary+params are baked in at construction
     cv::aruco::ArucoDetector detector;
 
+    //shared detect+solvePnP pipeline; frame is BGR. used by the godot-image path
+    Dictionary detect_and_solve_all(const cv::Mat &frame, float marker_size);
+
 protected:
     static void _bind_methods();
 
@@ -24,10 +29,8 @@ public:
     ~OpenCVProcessor();
 
     //function die wir in godot aufrufen wollen
-    Vector2 get_image_size(const String &file_path);
-    //Transform3D get_6dof_of_aruco_path_using_webcam();
-    Transform3D get_6dof_of_aruco_patch_from_picture(const String &file_path);
-    Transform3D get_6dof_of_aruco_patch_from_webcam(const float &marker_size);
     Dictionary get_6dof_of_all_aruco_patches_from_picture(const String &file_path);
     Dictionary get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size);
+    //takes a frame the Godot CameraServer already owns (avoids a second DSHOW capture on Windows)
+    Dictionary get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size);
 };

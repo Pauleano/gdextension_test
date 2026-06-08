@@ -9,17 +9,15 @@ var cam_texture: CameraTexture
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 
 func _ready() -> void:
-	#processor = OpenCVProcessor.new()
+	processor = OpenCVProcessor.new()
 
-	#for child in $Camera3D.get_children():
-	#	var n: String = child.name
-	#	if n.begins_with("aruco_patch"):
-	#		var id_str: String = n.substr(11)
-	#		if id_str.is_valid_int():
-	#			marker_nodes[id_str.to_int()] = child
-
-	#var output2: Transform3D = processor.get_6dof_of_aruco_patch_from_picture("res://assets/img_of_marker0_dict4x4_50.png")
-	#print(output2)
+#detect all available aruco_patch nodes, to later set their position
+	for child in $Camera3D.get_children():				
+		var n: String = child.name
+		if n.begins_with("aruco_patch"):
+			var id_str: String = n.substr(11)			#check nach dem elften substring
+			if id_str.is_valid_int():
+				marker_nodes[id_str.to_int()] = child
 
 	# --- live camera display via CameraServerExtension addon ---
 	camera_extension = CameraServerExtension.new()      # keep reference alive
@@ -27,7 +25,6 @@ func _ready() -> void:
 	CameraServer.monitoring_feeds = true                
 	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 	_on_camera_feeds_updated()                          # in case a feed is already present
-	
 
 func _on_camera_feeds_updated() -> void:
 	if cam_texture != null:
@@ -35,8 +32,7 @@ func _on_camera_feeds_updated() -> void:
 	if CameraServer.get_feed_count() == 0:				#if no camerafeeds available
 		return
 	
-	
-	#for i in range(CameraServer.get_feed_count()):
+	#for i in range(CameraServer.get_feed_count()): 	#to see all available feeds and their id
 	#	var feed = CameraServer.get_feed(i)
 	#	print("Index:", i, " ID:", feed.get_id())
 	
@@ -52,8 +48,14 @@ func _on_camera_feeds_updated() -> void:
 
 
 func _process(_delta: float) -> void:
-	return  # TEMP: disabled so Godot's CameraFeed can own the webcam (Windows = single owner)
-	# var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_webcam(0.05)
-	# for id in markers:
-	# 	if marker_nodes.has(id):
-	# 		marker_nodes[id].set_transform(markers[id])
+	# pull the frame Godot's CameraFeed already owns; no second webcam capture in OpenCV
+	if cam_texture == null:
+		return
+	var img := cam_texture.get_image() 
+	#print(img.get_format())                 #returns 4, meaning rgb8, lookup-table: https://docs.godotengine.org/en/stable/classes/class_image.html#enumerations
+	if img == null:
+		return
+	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
+	for id in markers:
+		if marker_nodes.has(id):
+			marker_nodes[id].set_transform(markers[id])

@@ -250,12 +250,12 @@
 	"orderDependencies" : 
 	[
 		{
-			"backtrace" : 5,
-			"id" : "snopek_tut::@6890427a1f51a3e7e1df"
-		},
-		{
 			"backtrace" : 4,
 			"id" : "generate_doc_source::@6890427a1f51a3e7e1df"
+		},
+		{
+			"backtrace" : 5,
+			"id" : "snopek_tut::@6890427a1f51a3e7e1df"
 		}
 	],
 	"paths" : 
