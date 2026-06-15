@@ -18,3 +18,11 @@ config/name="godot cpp template"
 run/main_scene="uid://catn06b43r1ce"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
+
+[rendering]
+
+textures/vram_compression/import_etc2_astc=true
+
+[xr]
+
+openxr/enabled=true

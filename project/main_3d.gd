@@ -12,7 +12,7 @@ func _ready() -> void:
 	processor = OpenCVProcessor.new()
 
 #detect all available aruco_patch nodes, to later set their position
-	for child in $Camera3D.get_children():				
+	for child in $XROrigin3D/XRCamera3D.get_children():
 		var n: String = child.name
 		if n.begins_with("aruco_patch"):
 			var id_str: String = n.substr(11)			#check nach dem elften substring

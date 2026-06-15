@@ -1,8 +1,0 @@
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/CMakeFiles/snopek_tut.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/CMakeFiles/generate_doc_source.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/CMakeFiles/edit_cache.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/CMakeFiles/rebuild_cache.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/godot-cpp/CMakeFiles/generate_bindings.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/godot-cpp/CMakeFiles/godot-cpp.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/godot-cpp/CMakeFiles/edit_cache.dir
-C:/Users/Paul Geiger/Documents/gdextension_test/gdextension_test/build/godot-cpp/CMakeFiles/rebuild_cache.dir

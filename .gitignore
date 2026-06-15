@@ -62,6 +62,17 @@ compile_commands.json
 cmake-build*
 CMakeUserPresets.json
 
+# CMake build output
+/build/
+
+# Gradle / Android build output
+.gradle/
+/project/android/build/
+
+# Android export artifacts
+*.apk
+*.aab
+
 # OpenCV (lokaler Build-Input, via Conan verwaltet — nicht eingecheckt)
 opencv/
 

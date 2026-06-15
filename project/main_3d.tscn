@@ -1,25 +1,29 @@
 [gd_scene format=3 uid="uid://catn06b43r1ce"]
 
 [ext_resource type="Script" uid="uid://crxyq5donm67c" path="res://main_3d.gd" id="1_wiwsh"]
+[ext_resource type="Script" path="res://xr_startup.gd" id="2_xr"]
 
 [sub_resource type="BoxMesh" id="BoxMesh_wiwsh"]
 
 [node name="main3d" type="Node3D" unique_id=327546220]
 script = ExtResource("1_wiwsh")
 
-[node name="Camera3D" type="Camera3D" parent="." unique_id=959766979]
+[node name="XROrigin3D" type="XROrigin3D" parent="."]
+script = ExtResource("2_xr")
 
-[node name="aruco_patch0" type="Node3D" parent="Camera3D" unique_id=1968016531]
+[node name="XRCamera3D" type="XRCamera3D" parent="XROrigin3D"]
+
+[node name="aruco_patch0" type="Node3D" parent="XROrigin3D/XRCamera3D" unique_id=1968016531]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="Camera3D/aruco_patch0" unique_id=297015256]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/XRCamera3D/aruco_patch0" unique_id=297015256]
 transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
 mesh = SubResource("BoxMesh_wiwsh")
 
-[node name="aruco_patch1" type="Node3D" parent="Camera3D" unique_id=603516852]
+[node name="aruco_patch1" type="Node3D" parent="XROrigin3D/XRCamera3D" unique_id=603516852]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="Camera3D/aruco_patch1" unique_id=656717756]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/XRCamera3D/aruco_patch1" unique_id=656717756]
 transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
 mesh = SubResource("BoxMesh_wiwsh")
 
