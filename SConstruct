@@ -159,6 +159,9 @@ elif env["platform"] == "android":
         subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
                         "--build=missing", "-pr:h", host_profile], check=True)
     merge_conan_deps(env, conan_out)
+    # OpenCV's videoio Android backend references the Camera2 NDK (libcamera2ndk/libmediandk);
+    # without these the .so fails to load on device with "undefined symbol ACameraManager_create".
+    env.Append(LIBS=["camera2ndk", "mediandk", "android", "log"])
     library = env.SharedLibrary(  # libsnopek_tut.android.<target>[.double].<arch>.so
         "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,

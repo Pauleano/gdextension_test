@@ -3,58 +3,69 @@ extends Node3D
 var processor: OpenCVProcessor
 var marker_nodes: Dictionary = {}
 
-# keep a reference so the camera backend isn't freed
-var camera_extension: CameraServerExtension
+# Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
+# CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
+# instantiate via ClassDB so the script still parses on Android, where the
+# CameraServerExtension class isn't registered.
+var camera_extension
 var cam_texture: CameraTexture
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 
 func _ready() -> void:
 	processor = OpenCVProcessor.new()
 
-#detect all available aruco_patch nodes, to later set their position
+	# detect all available aruco_patch nodes, to later set their position
 	for child in $XROrigin3D/XRCamera3D.get_children():
 		var n: String = child.name
 		if n.begins_with("aruco_patch"):
-			var id_str: String = n.substr(11)			#check nach dem elften substring
+			var id_str: String = n.substr(11)
 			if id_str.is_valid_int():
 				marker_nodes[id_str.to_int()] = child
 
-	# --- live camera display via CameraServerExtension addon ---
-	camera_extension = CameraServerExtension.new()      # keep reference alive
-	# enable feed enumeration (4.5+), Since Godot v4.5, CameraServerExtension requires setting CameraServer.monitoring_feeds to true before instantiation to provide custom feeds.
-	CameraServer.monitoring_feeds = true                
+	if OS.get_name() == "Android":
+		# Quest: request camera access; the native CameraServer surfaces feeds once granted.
+		OS.request_permission("android.permission.CAMERA")
+		OS.request_permission("horizonos.permission.HEADSET_CAMERA")
+	elif ClassDB.class_exists("CameraServerExtension"):
+		# Desktop (Windows): custom backend that registers the webcam as a feed.
+		camera_extension = ClassDB.instantiate("CameraServerExtension")  # keep reference alive
+
+	# Since Godot 4.5, monitoring_feeds must be true before feeds are enumerated.
+	CameraServer.monitoring_feeds = true
 	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 	_on_camera_feeds_updated()                          # in case a feed is already present
 
 func _on_camera_feeds_updated() -> void:
 	if cam_texture != null:
 		return                                          # already initialised
-	if CameraServer.get_feed_count() == 0:				#if no camerafeeds available
+	var feed_count := CameraServer.get_feed_count()
+	if feed_count == 0:
 		return
-	
-	#for i in range(CameraServer.get_feed_count()): 	#to see all available feeds and their id
-	#	var feed = CameraServer.get_feed(i)
-	#	print("Index:", i, " ID:", feed.get_id())
-	
-	var feed := CameraServer.get_feed(0)				#only have one laptop camera (index 0=use first available, but internal feed_id is "1")
+
+	# log every available feed so we can see which index is the (passthrough) camera on Quest
+	for i in range(feed_count):
+		var f := CameraServer.get_feed(i)
+		print("camera feed index ", i, " id ", f.get_id(), " name ", f.get_name())
+
+	var feed := CameraServer.get_feed(0)                # TODO: pick the passthrough feed once its index is known
 	feed.set_active(true)                               # start delivering frames
 	cam_texture = CameraTexture.new()
-	cam_texture.camera_feed_id = feed.get_id()			
-	
-	#print("Bildformat:", feed.get_datatype())			#returns 1 (RGB),lookup-table: https://docs.godotengine.org/en/stable/classes/class_camerafeed.html#enum-camerafeed-feeddatatype
+	cam_texture.camera_feed_id = feed.get_id()
 	cam_texture.which_feed = CameraServer.FEED_RGBA_IMAGE
 	cam_preview.texture = cam_texture
-	print("camera feeds: ", CameraServer.get_feed_count())
+	print("camera feeds: ", feed_count)
 
 
 func _process(_delta: float) -> void:
 	# pull the frame Godot's CameraFeed already owns; no second webcam capture in OpenCV
 	if cam_texture == null:
 		return
-	var img := cam_texture.get_image() 
-	#print(img.get_format())                 #returns 4, meaning rgb8, lookup-table: https://docs.godotengine.org/en/stable/classes/class_image.html#enumerations
+	var img := cam_texture.get_image()
 	if img == null:
 		return
+	# the C++ side assumes RGB8 (3 channels); guarantee that regardless of feed format
+	if img.get_format() != Image.FORMAT_RGB8:
+		img.convert(Image.FORMAT_RGB8)
 	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
 	for id in markers:
 		if marker_nodes.has(id):
