@@ -12,5 +12,18 @@ func _ready() -> void:
 		# The XR compositor drives frame pacing; disable the desktop v-sync.
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		get_viewport().use_xr = true
+		_enable_passthrough()
 	else:
 		print("OpenXR not initialised - running in flat (non-XR) mode")
+
+# Meta passthrough (AR): composite the rendered scene over the real world by switching the
+# XR environment blend mode to alpha-blend and clearing the viewport to transparent. Wherever
+# the scene draws nothing, the real-world camera shows through; opaque meshes render on top.
+func _enable_passthrough() -> void:
+	var modes := xr_interface.get_supported_environment_blend_modes()
+	if XRInterface.XR_ENV_BLEND_MODE_ALPHA_BLEND in modes:
+		xr_interface.environment_blend_mode = XRInterface.XR_ENV_BLEND_MODE_ALPHA_BLEND
+		get_viewport().transparent_bg = true
+		print("passthrough enabled (alpha blend)")
+	else:
+		print("alpha-blend passthrough not supported; available modes: ", modes)

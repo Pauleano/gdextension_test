@@ -21,10 +21,14 @@ config/icon="res://icon.svg"
 
 [rendering]
 
-renderer/rendering_method="mobile"
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
 textures/vram_compression/import_etc2_astc=true
+anti_aliasing/quality/screen_space_aa=1
 
 [xr]
 
 openxr/enabled=true
+openxr/environment_blend_mode=2
 openxr/extensions/hand_tracking=true
+openxr/extensions/meta/passthrough=true
