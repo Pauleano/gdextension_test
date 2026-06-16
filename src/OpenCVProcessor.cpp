@@ -178,18 +178,25 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
     //cv::Mat rgba(height, width, CV_8UC4, (void *)data.ptr());
     //cv::cvtColor(rgba, gray, cv::COLOR_RGBA2GRAY);
 
-    //hardcoded for this setup: CameraTexture.get_image() returns RGB8 (format 4)
-    //convert the <Ref> image input to opencv::Mat
+    // Channel count varies by platform/feed: desktop CameraServer gives RGB8 (3ch), while the
+    // Quest passthrough feed (YUV_420_888) hands us the Y/luminance plane as R8 (1ch) -- which
+    // is already grayscale. Pick the conversion from the actual bytes-per-pixel.
     int width = image->get_width();
     int height = image->get_height();
-        //makes image data accessible to opencv
-    PackedByteArray data = image->get_data();       //data owns image pixel data
-        //initialse cv::Mat which points to data
-    cv::Mat rgb(height, width, CV_8UC3, (void *)data.ptr());
-    
-    //detectMarkers wants 1- or 3-channel input and grayscales internally
-    cv::Mat gray;       //grayscaled output matrix 
-    cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
+    PackedByteArray data = image->get_data();        // data owns image pixel data
+    int channels = (width * height > 0) ? (int)(data.size() / (width * height)) : 0;
+
+    cv::Mat gray;                                    // grayscale matrix detectMarkers wants
+    if (channels == 1) {
+        // single-channel (Quest passthrough Y-plane) is already grayscale -- use directly
+        gray = cv::Mat(height, width, CV_8UC1, (void *)data.ptr());
+    } else if (channels == 4) {
+        cv::Mat rgba(height, width, CV_8UC4, (void *)data.ptr());
+        cv::cvtColor(rgba, gray, cv::COLOR_RGBA2GRAY);
+    } else {
+        cv::Mat rgb(height, width, CV_8UC3, (void *)data.ptr());
+        cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
+    }
 
     return detect_and_solve_all(gray, marker_size);
 }

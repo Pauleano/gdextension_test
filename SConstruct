@@ -25,6 +25,13 @@ localEnv = Environment(tools=["default"], PLATFORM="")
 customs = ["custom.py"]
 customs = [os.path.abspath(path) for path in customs]
 
+# Camera2 NDK (libcamera2ndk/libmediandk, needed by OpenCV's videoio Android backend) only
+# exists in the NDK sysroot from API 24+. godot-cpp defaults android_api_level to 21, where
+# linking fails with "-lcamera2ndk". Pin it to 24 for android builds (matches the Conan
+# android profile's os.api_level). Explicit android_api_level=... on the CLI still wins.
+if ARGUMENTS.get("platform") == "android":
+    ARGUMENTS.setdefault("android_api_level", "24")
+
 opts = Variables(customs, ARGUMENTS)
 opts.Update(localEnv)
 

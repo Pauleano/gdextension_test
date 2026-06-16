@@ -9,6 +9,7 @@ var marker_nodes: Dictionary = {}
 # CameraServerExtension class isn't registered.
 var camera_extension
 var cam_texture: CameraTexture
+var _logged_img := false
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 
 func _ready() -> void:
@@ -47,9 +48,32 @@ func _on_camera_feeds_updated() -> void:
 		var f := CameraServer.get_feed(i)
 		print("camera feed index ", i, " id ", f.get_id(), " name ", f.get_name())
 
-	var feed := CameraServer.get_feed(0)                # TODO: pick the passthrough feed once its index is known
+	# Quest exposes 3 feeds: "1 | FRONT" plus the passthrough pair "50 | BACK" / "51 | BACK".
+	# The world-facing ("BACK") cameras are the passthrough ones we want for marker tracking;
+	# feed 0 (FRONT) is the wrong camera. Desktop has a single feed, so it falls through to 0.
+	var feed: CameraFeed = null
+	for i in range(feed_count):
+		var f := CameraServer.get_feed(i)
+		if "BACK" in f.get_name():
+			feed = f
+			break
+	if feed == null:
+		feed = CameraServer.get_feed(0)
+
+	# Godot's native CameraServer requires a format to be chosen BEFORE set_active(), else
+	# "format needs to be set before activating (index -1)" and no frames are delivered.
+	# Log all formats so we can pick the best one; start with index 0.
+	var formats := feed.get_formats()
+	for j in range(formats.size()):
+		print("feed format ", j, ": ", formats[j])
+	if formats.size() > 2:
+		feed.set_format(2, {})        # 640x480 YUV_420_888 (good ArUco res, light on CPU)
+	elif formats.size() > 0:
+		feed.set_format(0, {})
+
 	feed.set_active(true)                               # start delivering frames
 	cam_texture = CameraTexture.new()
+	print("feed id of used feed",feed.get_id())
 	cam_texture.camera_feed_id = feed.get_id()
 	cam_texture.which_feed = CameraServer.FEED_RGBA_IMAGE
 	cam_preview.texture = cam_texture
@@ -63,9 +87,11 @@ func _process(_delta: float) -> void:
 	var img := cam_texture.get_image()
 	if img == null:
 		return
-	# the C++ side assumes RGB8 (3 channels); guarantee that regardless of feed format
-	if img.get_format() != Image.FORMAT_RGB8:
-		img.convert(Image.FORMAT_RGB8)
+	if not _logged_img and img.get_width() > 4:
+		_logged_img = true
+		print("REAL camera frame ", img.get_width(), "x", img.get_height(), " format ", img.get_format())
+	# No conversion: the C++ side now handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA)
+	# from the raw image data. Converting R8->RGB8 here would zero G/B and darken the image.
 	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
 	for id in markers:
 		if marker_nodes.has(id):
