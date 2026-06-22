@@ -118,20 +118,29 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
+    // Profiling: split the per-frame cost into detectMarkers vs. solvePnP so we can see which one
+    // dominates on the Quest. cv::getTickCount/Frequency -> milliseconds.
+    double tick_freq = cv::getTickFrequency();
+    int64_t t_detect = cv::getTickCount();
     detector.detectMarkers(frame, corners, ids);
+    double detect_ms = (cv::getTickCount() - t_detect) / tick_freq * 1000.0;
+    UtilityFunctions::print("detectMarkers=", detect_ms, "ms");
 
     if (ids.empty()) {
         UtilityFunctions::printerr("Kein Marker erkannt");
         return result;
     }
 
+    double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
         cv::Mat rvec, tvec;
+        int64_t t_solve = cv::getTickCount();
         bool ok2 = cv::solvePnP(
             obj_pts, corners[i], Kamera_matrix, distort,
             rvec, tvec,
             false,
             cv::SOLVEPNP_IPPE_SQUARE);
+        solve_ms += (cv::getTickCount() - t_solve) / tick_freq * 1000.0;
         if (!ok2) {
             continue;
         }
@@ -154,6 +163,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
         result[ids[i]] = Transform3D(basis, origin);
     }
 
+    UtilityFunctions::print("solvePnP total=", solve_ms, "ms  (", (int)ids.size(), " markers)");
     return result;
 }
 

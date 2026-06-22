@@ -10,17 +10,33 @@ var marker_nodes: Dictionary = {}
 var camera_extension
 var cam_texture: CameraTexture
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
+@onready var xr_origin: XROrigin3D = $XROrigin3D
+@onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
+
+#set to true or false if rendered aruco-patches should be parented to camera or origin
+#an attempt to more smootly show the rendered aruco-patches (on the quest)
+var reparent_to_origin = false
+
 
 func _ready() -> void:
 	processor = OpenCVProcessor.new()
 
 	# detect all available aruco_patch nodes, to later set their position
-	for child in $XROrigin3D/XRCamera3D.get_children():
+	for child in xr_camera.get_children():
 		var n: String = child.name
 		if n.begins_with("aruco_patch"):
 			var id_str: String = n.substr(11)
 			if id_str.is_valid_int():
 				marker_nodes[id_str.to_int()] = child
+	
+	if reparent_to_origin:
+	# Reparent the patches out of the camera and into the (stationary) tracking origin.
+	# solvePnP gives a CAMERA-relative pose; as a child of XRCamera3D that pose would be
+	# re-multiplied by the LIVE head transform every frame, so a stale detection rides the
+	# head and "swims" when you move. Anchored in XROrigin3D world space instead, we bake the
+	# pose once at detection time (see _process) and it stays fixed on the real marker.
+		for id in marker_nodes:
+			marker_nodes[id].reparent(xr_origin, false) #reparent(new_parent: Node, keep_global_transform: bool = false)
 
 	if OS.get_name() == "Android":
 		# Quest: request camera access; the native CameraServer surfaces feeds once granted.
@@ -64,7 +80,7 @@ func _on_camera_feeds_updated() -> void:
 	for j in range(formats.size()):
 		print("feed format ", j, ": ", formats[j])
 	if formats.size() > 2:
-		feed.set_format(2, {})        # 640x480 YUV_420_888 (good ArUco res, light on CPU)
+		feed.set_format(2, {})        # 640x480 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
 	elif formats.size() > 0:
 		feed.set_format(0, {})
 
@@ -80,16 +96,36 @@ func _process(_delta: float) -> void:
 	# pull the frame Godot's CameraFeed already owns; no second webcam capture in OpenCV
 	if cam_texture == null:
 		return
-	var img := cam_texture.get_image()
+	# Schritt 0 (Profiling): time the GPU->CPU readback vs. the OpenCV detection separately so
+	# we can see on the Quest which one dominates the per-frame cost before optimising further.
+	var t0 := Time.get_ticks_usec()
+	var img := cam_texture.get_image()                  # GPU->CPU readback (stays on main thread)
+	var t1 := Time.get_ticks_usec()
 	if img == null:
 		return
 	# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA)
 	# from the raw image data. Converting R8->RGB8 here would zero G/B and darken the image.
 	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
-	for id in markers:
-		if marker_nodes.has(id):
-			print("id: ",id," 6dofs: ",markers[id])
-			marker_nodes[id].set_transform(markers[id])
-
+	var t2 := Time.get_ticks_usec()
+	print("readback=", (t1 - t0) / 1000.0, "ms  detect=", (t2 - t1) / 1000.0,
+			"ms  fps=", Engine.get_frames_per_second()," readback>detection: ",(t1 - t0)>(t2 - t1))
+	# Sample the head pose once, here, so every marker is baked against the same camera transform.
+	if reparent_to_origin:
+		var cam_xform := xr_camera.global_transform
+		for id in markers:
+			if marker_nodes.has(id):
+				print("id: ",id," 6dofs: ",markers[id])
+				# markers[id] is the marker pose in CAMERA space. Convert it to world space using the
+				# camera's current global transform and freeze it there. Between detections the head
+				# can move freely without dragging the patch along.
+				marker_nodes[id].global_transform = cam_xform * markers[id]
+	else:
+		for id in markers:
+			if marker_nodes.has(id):
+				print("id: ",id," 6dofs: ",markers[id])
+				# markers[id] is the marker pose in CAMERA space. Convert it to world space using the
+				# camera's current global transform and freeze it there. Between detections the head
+				# can move freely without dragging the patch along.
+				marker_nodes[id].set_transform(markers[id])
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop com.example.godotcpptemplate
