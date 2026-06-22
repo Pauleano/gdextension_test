@@ -17,7 +17,9 @@ void OpenCVProcessor::_bind_methods() {
 
 OpenCVProcessor::OpenCVProcessor() {
     cv::aruco::DetectorParameters params;
-    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
+    // Corner refinement runs INSIDE detectMarkers (objdetect ArucoDetector). NONE is cheapest;
+    // CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
+    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_NONE;
     detector = cv::aruco::ArucoDetector(
         cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50),
         params);
@@ -99,6 +101,21 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size) {
     Dictionary result;
 
+    double tick_freq = cv::getTickFrequency();
+
+    // Downscale before detection: the adaptive-threshold + contour stage scales with pixel count,
+    // so 0.5 = ~4x fewer pixels. The fake intrinsics (fx=fy=width) scale with the image too, so the
+    // metric pose stays correct; only corner localisation gets coarser. Set to 1.0f to disable.
+    const float DETECT_DOWNSCALE = 0.5f;
+    int64_t t_resize = cv::getTickCount();
+    cv::Mat det_frame;
+    if (DETECT_DOWNSCALE != 1.0f) {
+        cv::resize(frame, det_frame, cv::Size(), DETECT_DOWNSCALE, DETECT_DOWNSCALE, cv::INTER_AREA);
+    } else {
+        det_frame = frame;
+    }
+    double resize_ms = (cv::getTickCount() - t_resize) / tick_freq * 1000.0;
+
     float half = marker_size / 2.0f;
     std::vector<cv::Point3f> obj_pts = {
         {-half,  half, 0.0f},
@@ -107,8 +124,9 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
         {-half, -half, 0.0f}
     };
 
-    float w = static_cast<float>(frame.cols);
-    float h = static_cast<float>(frame.rows);
+    // Intrinsics derived from the (downscaled) detection frame, so corners + K share one pixel space.
+    float w = static_cast<float>(det_frame.cols);
+    float h = static_cast<float>(det_frame.rows);
 
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         w, 0, w/2.0f,
@@ -118,13 +136,11 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
-    // Profiling: split the per-frame cost into detectMarkers vs. solvePnP so we can see which one
-    // dominates on the Quest. cv::getTickCount/Frequency -> milliseconds.
-    double tick_freq = cv::getTickFrequency();
+    // Profiling: split the per-frame cost so we can see which stage dominates on the Quest.
     int64_t t_detect = cv::getTickCount();
-    detector.detectMarkers(frame, corners, ids);
+    detector.detectMarkers(det_frame, corners, ids);
     double detect_ms = (cv::getTickCount() - t_detect) / tick_freq * 1000.0;
-    UtilityFunctions::print("detectMarkers=", detect_ms, "ms");
+    UtilityFunctions::print("resize=", resize_ms, "ms  detectMarkers=", detect_ms, "ms");
 
     if (ids.empty()) {
         UtilityFunctions::printerr("Kein Marker erkannt");
