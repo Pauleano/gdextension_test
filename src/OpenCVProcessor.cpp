@@ -16,6 +16,18 @@ void OpenCVProcessor::_bind_methods() {
 }
 
 OpenCVProcessor::OpenCVProcessor() {
+    // Which parallel_for_ backend OpenCV was built with (pthreads/TBB/OpenMP/...).
+    // Fixed at build time; pull out the one line instead of dumping the whole block.
+    {
+        std::string info = cv::getBuildInformation();
+        size_t pos = info.find("Parallel framework:");
+        if (pos != std::string::npos) {
+            size_t end = info.find('\n', pos);
+            std::string line = info.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            UtilityFunctions::print("OpenCV ", String(line.c_str()));
+        }
+    }
+
     cv::aruco::DetectorParameters params;
     // Corner refinement runs INSIDE detectMarkers (objdetect ArucoDetector). NONE is cheapest;
     // CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
