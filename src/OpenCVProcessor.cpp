@@ -2,6 +2,7 @@
 #include <godot_cpp/variant/utility_functions.hpp> 
 #include <opencv2/opencv.hpp> //solvepnp should be inside of calib3d module which is inside opencv
 #include <godot_cpp/classes/project_settings.hpp> //to convert path starting from res: to global path
+#include <algorithm> //std::clamp for the downscale parameter
 //#include <godot_cpp/variant/transform3d.hpp> wird momentan nicht benötigt, da es von wo anders anscheinend schon reingezogen wird
 //#include <opencv2/objdetect/aruco_detector.hpp> falls error "incomplete type" auftauchen sollten 
 
@@ -10,7 +11,7 @@ using namespace godot;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
+    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image, DEFVAL(0.7f));
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
 }
@@ -102,15 +103,16 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). uses the passed marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale) {
     Dictionary result;
 
     double tick_freq = cv::getTickFrequency();
 
     // Downscale before detection: the adaptive-threshold + contour stage scales with pixel count,
     // so 0.5 = ~4x fewer pixels. The fake intrinsics (fx=fy=width) scale with the image too, so the
-    // metric pose stays correct; only corner localisation gets coarser. Set to 1.0f to disable.
-    const float DETECT_DOWNSCALE = 0.5f;
+    // metric pose stays correct; only corner localisation gets coarser. Pass 1.0f to disable.
+    // Clamp to a sane range so a bad value from GDScript can't blow up cv::resize.
+    const float DETECT_DOWNSCALE = std::clamp(downscale, 0.05f, 1.0f);
     int64_t t_resize = cv::getTickCount();
     cv::Mat det_frame;
     if (DETECT_DOWNSCALE != 1.0f) {
@@ -188,7 +190,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -228,7 +230,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
     }
 
-    return detect_and_solve_all(gray, marker_size);
+    return detect_and_solve_all(gray, marker_size, downscale);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {
