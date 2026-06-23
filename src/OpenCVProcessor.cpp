@@ -23,7 +23,7 @@ OpenCVProcessor::OpenCVProcessor() {
     cv::aruco::DetectorParameters params;
     // Corner refinement runs INSIDE detectMarkers (objdetect ArucoDetector). NONE is cheapest;
     // CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
-    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_CONTOUR;
+    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     detector = cv::aruco::ArucoDetector(
         cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50),
         params);
@@ -110,7 +110,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     // Downscale before detection: the adaptive-threshold + contour stage scales with pixel count,
     // so 0.5 = ~4x fewer pixels. The fake intrinsics (fx=fy=width) scale with the image too, so the
     // metric pose stays correct; only corner localisation gets coarser. Set to 1.0f to disable.
-    const float DETECT_DOWNSCALE = 1.0f;
+    const float DETECT_DOWNSCALE = 0.5f;
     int64_t t_resize = cv::getTickCount();
     cv::Mat det_frame;
     if (DETECT_DOWNSCALE != 1.0f) {
