@@ -13,10 +13,22 @@ var cam_texture: CameraTexture
 @onready var xr_origin: XROrigin3D = $XROrigin3D
 @onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
 
-#set to true or false if rendered aruco-patches should be parented to camera or origin
-#an attempt to more smootly show the rendered aruco-patches (on the quest)
-var reparent_to_origin = true
-
+# --- Detection worker thread (Teil B) ---
+# On the Quest the OpenCV detection costs ~80ms, which run synchronously would cap the whole
+# app at ~10fps. We move ONLY the detection (detectMarkers + solvePnP) onto a background thread;
+# get_image() and all scene-tree writes stay on the main thread (neither is thread-safe).
+var _detect_thread: Thread
+var _detect_mutex: Mutex
+var _detect_sem: Semaphore
+var _detect_exit := false
+# input slot (main -> worker), guarded by _detect_mutex; only the newest frame is kept (frame drop)
+var _pending_image: Image
+var _pending_cam_xform: Transform3D
+var _has_pending := false
+# output slot (worker -> main), guarded by _detect_mutex
+var _result_markers: Dictionary = {}
+var _result_cam_xform: Transform3D
+var _has_result := false
 
 func _ready() -> void:
 	processor = OpenCVProcessor.new()
@@ -29,14 +41,20 @@ func _ready() -> void:
 			if id_str.is_valid_int():
 				marker_nodes[id_str.to_int()] = child
 	
-	if reparent_to_origin:
 	# Reparent the patches out of the camera and into the (stationary) tracking origin.
 	# solvePnP gives a CAMERA-relative pose; as a child of XRCamera3D that pose would be
 	# re-multiplied by the LIVE head transform every frame, so a stale detection rides the
 	# head and "swims" when you move. Anchored in XROrigin3D world space instead, we bake the
 	# pose once at detection time (see _process) and it stays fixed on the real marker.
-		for id in marker_nodes:
-			marker_nodes[id].reparent(xr_origin, false) #reparent(new_parent: Node, keep_global_transform: bool = false)
+	for id in marker_nodes:
+		marker_nodes[id].reparent(xr_origin, false) #reparent(new_parent: Node, keep_global_transform: bool = false)
+
+	# Spin up the detection worker. processor and marker_nodes are ready by now; the loop only
+	# needs the processor (no scene-tree access), so it is safe to start before any feed exists.
+	_detect_mutex = Mutex.new()
+	_detect_sem = Semaphore.new()
+	_detect_thread = Thread.new()
+	_detect_thread.start(_detection_loop)
 
 	if OS.get_name() == "Android":
 		# Quest: request camera access; the native CameraServer surfaces feeds once granted.
@@ -93,39 +111,75 @@ func _on_camera_feeds_updated() -> void:
 
 
 func _process(_delta: float) -> void:
-	# pull the frame Godot's CameraFeed already owns; no second webcam capture in OpenCV
 	if cam_texture == null:
 		return
-	# Schritt 0 (Profiling): time the GPU->CPU readback vs. the OpenCV detection separately so
-	# we can see on the Quest which one dominates the per-frame cost before optimising further.
-	var t0 := Time.get_ticks_usec()
-	var img := cam_texture.get_image()                  # GPU->CPU readback (stays on main thread)
-	var t1 := Time.get_ticks_usec()
+
+	# (a) Apply the latest finished detection (main thread -> scene-tree writes are safe here).
+	# markers + cam_xform come from the worker; cam_xform was sampled at the frame's CAPTURE time
+	# (not now), so the world bake matches the frame the markers were detected in -- using the
+	# live head pose here would re-introduce the ~80ms of head motion as swim.
+	_detect_mutex.lock()
+	var have_result := _has_result
+	var markers: Dictionary = _result_markers
+	var cam_xform: Transform3D = _result_cam_xform
+	_has_result = false
+	_detect_mutex.unlock()
+	if have_result:
+		for id in markers:
+			if marker_nodes.has(id):
+				# markers[id] is the marker pose in CAMERA space; cam_xform is the head pose at
+				# capture time. Bake to world space and freeze it there, so the head can move
+				# between detections without dragging the patch along.
+				marker_nodes[id].global_transform = cam_xform * markers[id]
+
+	# (b) Hand the newest camera frame to the worker. get_image() (the GPU->CPU readback) and the
+	# head-pose snapshot must happen on the main thread; the worker only does the OpenCV work.
+	var img := cam_texture.get_image()
 	if img == null:
 		return
-	# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA)
-	# from the raw image data. Converting R8->RGB8 here would zero G/B and darken the image.
-	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
-	var t2 := Time.get_ticks_usec()
-	print("readback=", (t1 - t0) / 1000.0, "ms  detect=", (t2 - t1) / 1000.0,
-			"ms  fps=", Engine.get_frames_per_second()," readback>detection: ",(t1 - t0)>(t2 - t1))
-	# Sample the head pose once, here, so every marker is baked against the same camera transform.
-	if reparent_to_origin:
-		var cam_xform := xr_camera.global_transform
-		for id in markers:
-			if marker_nodes.has(id):
-				print("id: ",id," 6dofs: ",markers[id])
-				# markers[id] is the marker pose in CAMERA space. Convert it to world space using the
-				# camera's current global transform and freeze it there. Between detections the head
-				# can move freely without dragging the patch along.
-				marker_nodes[id].global_transform = cam_xform * markers[id]
-	else:
-		for id in markers:
-			if marker_nodes.has(id):
-				print("id: ",id," 6dofs: ",markers[id])
-				# markers[id] is the marker pose in CAMERA space. Convert it to world space using the
-				# camera's current global transform and freeze it there. Between detections the head
-				# can move freely without dragging the patch along.
-				marker_nodes[id].set_transform(markers[id])
+	var cap_cam_xform := xr_camera.global_transform     # head pose AT capture time, for world bake
+	_detect_mutex.lock()
+	var was_pending := _has_pending
+	_pending_image = img                                # overwrites any unconsumed frame -> frame drop
+	_pending_cam_xform = cap_cam_xform
+	_has_pending = true
+	_detect_mutex.unlock()
+	if not was_pending:
+		_detect_sem.post()                                 # only wake once per pending frame (bounded sem)
+
+# Worker thread: blocks on the semaphore, runs OpenCV detection off the main thread, and parks the
+# result for _process to apply. Touches only `processor` and value types -- never the scene tree.
+func _detection_loop() -> void:
+	while true:
+		_detect_sem.wait()
+		if _detect_exit:
+			return
+		_detect_mutex.lock()
+		var img: Image = _pending_image
+		var cam_xform: Transform3D = _pending_cam_xform
+		_has_pending = false
+		_pending_image = null
+		_detect_mutex.unlock()
+		if img == null:
+			continue
+		# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
+		var t0 := Time.get_ticks_usec()
+		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
+		print("detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second())
+		_detect_mutex.lock()
+		_result_markers = markers
+		_result_cam_xform = cam_xform
+		_has_result = true
+		_detect_mutex.unlock()
+
+func _exit_tree() -> void:
+	# Wake the worker out of its wait() and join it, so the thread doesn't outlive the scene.
+	if _detect_thread != null and _detect_thread.is_started():
+		_detect_mutex.lock()
+		_detect_exit = true
+		_detect_mutex.unlock()
+		_detect_sem.post()
+		_detect_thread.wait_to_finish()
+
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop com.example.godotcpptemplate
