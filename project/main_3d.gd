@@ -15,7 +15,7 @@ var cam_texture: CameraTexture
 
 #set to true or false if rendered aruco-patches should be parented to camera or origin
 #an attempt to more smootly show the rendered aruco-patches (on the quest)
-var reparent_to_origin = false
+var reparent_to_origin = true
 
 
 func _ready() -> void:

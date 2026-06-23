@@ -20,6 +20,7 @@ class GdextensionOpenCV(ConanFile):
         # Statisch in die Shared-Lib (GDExtension) linken -> PIC noetig.
         "opencv/*:shared": False,
         "opencv/*:fPIC": True,
+        "opencv/*:parallel": "openmp",   # <-- threading backend for parallel_for_ (detectMarkers)
         # Module, die OpenCVProcessor wirklich nutzt
         "opencv/*:objdetect": True,   # cv::aruco::ArucoDetector
         "opencv/*:calib3d": True,     # solvePnP / Rodrigues
