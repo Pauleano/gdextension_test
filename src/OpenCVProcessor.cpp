@@ -103,7 +103,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
                 ACAMERA_LENS_DISTORTION,
                 &dist) == ACAMERA_OK && dist.count >= 5)
         {
-            
+            UtilityFunctions::print("get_const_entry for distortions worked");
             D = cv::Mat(1, dist.count, CV_32F);
 
             for (int j = 0; j < dist.count; j++){
