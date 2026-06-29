@@ -98,10 +98,12 @@ void OpenCVProcessor::init_quest_intrinsics() {
         // -------------------------
         // DISTORTION
         // -------------------------
-        if (ACameraMetadata_getConstEntry(
+        camera_status_t test= ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_DISTORTION,
-                &dist) == ACAMERA_OK && dist.count >= 5)
+                &dist);
+        
+        if (test == ACAMERA_OK && dist.count >= 5)
         {
             UtilityFunctions::print("get_const_entry for distortions worked");
             D = cv::Mat(1, dist.count, CV_32F);
@@ -113,7 +115,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
         }
         UtilityFunctions::print("count:", dist.count);
         UtilityFunctions::print("type:", dist.type);
-        //UtilityFunctions::print("ptr:",(void*)dist.data.f); 
+        UtilityFunctions::print("getConst_entry for distortions:",test); 
         UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
 
         ACameraMetadata_free(meta);
