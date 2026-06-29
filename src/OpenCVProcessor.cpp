@@ -81,6 +81,10 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float fy = intr.data.f[1];
             float cx = intr.data.f[2];
             float cy = intr.data.f[3];
+            UtilityFunctions::print(fx);
+            UtilityFunctions::print(fy);
+            UtilityFunctions::print(cx);
+            UtilityFunctions::print(cy);
 
             K = (cv::Mat_<float>(3,3) <<
                 fx, 0,  cx,
@@ -88,7 +92,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
                 0,  0,  1
             );
 
-            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str(), K);
+            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str());
         }
 
         // -------------------------
@@ -101,10 +105,12 @@ void OpenCVProcessor::init_quest_intrinsics() {
         {
             D = cv::Mat(1, dist.count, CV_32F);
 
-            for (int j = 0; j < dist.count; j++)
+            for (int j = 0; j < dist.count; j++){
                 D.at<float>(j) = dist.data.f[j];
+                UtilityFunctions::print(dist.data.f[j]);
+            }
         }
-        UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str(), D);
+        UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
 
         ACameraMetadata_free(meta);
     }
