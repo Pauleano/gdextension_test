@@ -86,9 +86,13 @@ void OpenCVProcessor::init_quest_intrinsics() {
             UtilityFunctions::print(cx);
             UtilityFunctions::print(cy);
             
+            //need to rescale the 1280x1280 camera intrinsics (quest3 resolution) to the 640x480 (resolution used in gdscript)
+            float sx= 640/1280;
+            float sy= 480/1280;
+
             cv::Mat K = (cv::Mat_<float>(3,3) <<
-                fx, 0,  cx,
-                0,  fy, cy,
+                fx*sx, 0,  cx*sx,
+                0,  fy*sy, cy*sy,
                 0,  0,  1
             );
             if (sid == "50") {

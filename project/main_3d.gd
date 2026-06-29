@@ -97,8 +97,8 @@ func _on_camera_feeds_updated() -> void:
 	var formats := feed.get_formats()
 	for j in range(formats.size()):
 		print("feed format ", j, ": ", formats[j])
-	if formats.size() > 2:
-		feed.set_format(2, {})        # 640x480 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
+	if formats.size() > 10:
+		feed.set_format(10, {})        # 640x480 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
 	elif formats.size() > 0:
 		feed.set_format(0, {})
 
