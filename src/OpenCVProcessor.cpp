@@ -85,13 +85,19 @@ void OpenCVProcessor::init_quest_intrinsics() {
             UtilityFunctions::print(fy);
             UtilityFunctions::print(cx);
             UtilityFunctions::print(cy);
-
-            K = (cv::Mat_<float>(3,3) <<
+            
+            cv::Mat K = (cv::Mat_<float>(3,3) <<
                 fx, 0,  cx,
                 0,  fy, cy,
                 0,  0,  1
             );
+            if (sid == "50") {
+                K_cam50 = K;
+            }
 
+            if (sid == "51") {
+                K_cam51 = K;
+            }
             UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str());
         }
 
@@ -112,12 +118,12 @@ void OpenCVProcessor::init_quest_intrinsics() {
                 D.at<float>(j) = dist.data.f[j];
 
             }
+            UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
         }
         UtilityFunctions::print("count:", dist.count);
         UtilityFunctions::print("type:", dist.type);
-        UtilityFunctions::print("getConst_entry for distortions:",test); 
-        UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
-
+        UtilityFunctions::print("getConst_entry for distortions:",test); //getConst_entry for distortions:-10004 means couldnt get distortion coefficients
+        
         ACameraMetadata_free(meta);
     }
 
@@ -225,13 +231,23 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     };
 
     // Intrinsics derived from the (downscaled) detection frame, so corners + K share one pixel space.
+    /*
     float w = static_cast<float>(det_frame.cols);
     float h = static_cast<float>(det_frame.rows);
 
+    
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         w, 0, w/2.0f,
         0, w, h/2.0f,
         0, 0, 1);
+    */
+    cv::Mat Kamera_matrix;
+
+    if (current_camera_id == 50)
+        Kamera_matrix = K_cam50;
+    else
+        Kamera_matrix = K_cam51;
+
     cv::Mat distort = cv::Mat::zeros(5, 1, CV_32F);
 
     std::vector<std::vector<cv::Point2f>> corners;

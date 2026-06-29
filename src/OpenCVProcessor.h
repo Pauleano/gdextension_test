@@ -23,7 +23,9 @@ private:
     Dictionary detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale);
 
     //for intrinsics
-    cv::Mat K; //intrinsics matrix
+    cv::Mat K_cam50; //intrinsics matrix
+    cv::Mat K_cam51;
+    int current_camera_id =50; //use first back camera and 50 is listed before 51, so camera 50 is always used
     cv::Mat D; //distortions
     bool intrinsics_ready = false;
     void init_quest_intrinsics();
