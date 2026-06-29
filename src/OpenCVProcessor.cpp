@@ -5,6 +5,11 @@
 #include <algorithm> //std::clamp for the downscale parameter
 //#include <godot_cpp/variant/transform3d.hpp> wird momentan nicht benötigt, da es von wo anders anscheinend schon reingezogen wird
 //#include <opencv2/objdetect/aruco_detector.hpp> falls error "incomplete type" auftauchen sollten 
+//for intrinsics
+#include <camera/NdkCameraManager.h>
+#include <camera/NdkCameraMetadata.h>
+#include <camera/NdkCameraMetadataTags.h>
+#include <android/log.h>
 
 using namespace godot;
 
@@ -17,19 +22,92 @@ void OpenCVProcessor::_bind_methods() {
 }
 
 OpenCVProcessor::OpenCVProcessor() {
-    // Full build configuration. Look for "Parallel framework:" (pthreads/TBB/OpenMP)
-    // and the "CPU/HW features" / "Baseline:" lines (NEON on arm64). Build-time fixed.
-    UtilityFunctions::print(String(cv::getBuildInformation().c_str()));
+    
+    UtilityFunctions::print(String(cv::getBuildInformation().c_str())); // Full build configuration.
 
     cv::aruco::DetectorParameters params;
-    // Corner refinement runs INSIDE detectMarkers (objdetect ArucoDetector). NONE is cheapest;
-    // CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
+    
+    //NONE is cheapest; CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
     params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     detector = cv::aruco::ArucoDetector(
         cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50),
         params);
+    
+    init_quest_intrinsics();
 }
 OpenCVProcessor::~OpenCVProcessor() {}
+
+
+void OpenCVProcessor::init_quest_intrinsics() {
+
+    ACameraManager *mgr = ACameraManager_create();
+
+    ACameraIdList *idList = nullptr;
+    if (ACameraManager_getCameraIdList(mgr, &idList) != ACAMERA_OK) {
+        UtilityFunctions::printerr("CameraIdList failed");
+        return;
+    }
+
+    for (int i = 0; i < idList->numCameras; i++) {
+
+        const char *id = idList->cameraIds[i];
+
+        // only care about Quest tracking cams
+        std::string sid(id);
+        if (sid != "50" && sid != "51")
+            continue;
+
+        ACameraMetadata *meta = nullptr;
+
+        if (ACameraManager_getCameraCharacteristics(mgr, id, &meta) != ACAMERA_OK)
+            continue;
+
+        ACameraMetadata_const_entry entry;
+
+        // -------------------------
+        // INTRINSIC MATRIX
+        // -------------------------
+        if (ACameraMetadata_getConstEntry(
+                meta,
+                ACAMERA_LENS_INTRINSIC_CALIBRATION,
+                &entry) == ACAMERA_OK && entry.count == 5)
+        {
+            float fx = entry.data.f[0];
+            float fy = entry.data.f[1];
+            float cx = entry.data.f[2];
+            float cy = entry.data.f[3];
+
+            K = (cv::Mat_<float>(3,3) <<
+                fx, 0,  cx,
+                0,  fy, cy,
+                0,  0,  1
+            );
+
+            intrinsics_ready = true;
+
+            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str());
+        }
+
+        // -------------------------
+        // DISTORTION
+        // -------------------------
+        if (ACameraMetadata_getConstEntry(
+                meta,
+                ACAMERA_LENS_DISTORTION,
+                &entry) == ACAMERA_OK && entry.count >= 5)
+        {
+            D = cv::Mat(1, entry.count, CV_32F);
+
+            for (int j = 0; j < entry.count; j++)
+                D.at<float>(j) = entry.data.f[j];
+        }
+
+        ACameraMetadata_free(meta);
+    }
+
+    ACameraManager_deleteCameraIdList(idList);
+    ACameraManager_delete(mgr);
+}
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const String &res_path) {
     Dictionary result;

@@ -164,8 +164,8 @@ func _detection_loop() -> void:
 			continue
 		# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
 		var t0 := Time.get_ticks_usec()
-		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05)
-		print("detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second())
+		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05,1)
+		print("detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
 		_detect_mutex.lock()
 		_result_markers = markers
 		_result_cam_xform = cam_xform

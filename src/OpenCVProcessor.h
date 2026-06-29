@@ -22,6 +22,12 @@ private:
     //downscale (0<d<=1) shrinks the frame before detectMarkers -- the dominant cost on Quest.
     Dictionary detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale);
 
+    //for intrinsics
+    cv::Mat K; //intrinsics matrix
+    cv::Mat D; //distortions
+    bool intrinsics_ready = false;
+    void init_quest_intrinsics();
+
 protected:
     static void _bind_methods();
 
