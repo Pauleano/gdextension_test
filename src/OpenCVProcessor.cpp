@@ -66,12 +66,12 @@ void OpenCVProcessor::init_quest_intrinsics() {
 
         ACameraMetadata_const_entry intr;
         ACameraMetadata_const_entry dist;
+        
 
         // -------------------------
         // INTRINSIC MATRIX
         // -------------------------
-        
-        
+
         if (ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_INTRINSIC_CALIBRATION,
@@ -108,11 +108,12 @@ void OpenCVProcessor::init_quest_intrinsics() {
 
             for (int j = 0; j < dist.count; j++){
                 D.at<float>(j) = dist.data.f[j];
-                UtilityFunctions::print(dist.data.f[j]);
+
             }
         }
         UtilityFunctions::print("count:", dist.count);
         UtilityFunctions::print("type:", dist.type);
+        UtilityFunctions::print(dist.data.f);
         UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
 
         ACameraMetadata_free(meta);
