@@ -87,12 +87,10 @@ void OpenCVProcessor::init_quest_intrinsics() {
             UtilityFunctions::print(cy);
             
             //need to rescale the 1280x1280 camera intrinsics (quest3 resolution) to the 640x480 (resolution used in gdscript)
-            float sx= 640/1280;
-            float sy= 480/1280;
-
+            
             cv::Mat K = (cv::Mat_<float>(3,3) <<
-                fx*sx, 0,  cx*sx,
-                0,  fy*sy, cy*sy,
+                fx, 0,  cx,
+                0,  fy, cy,
                 0,  0,  1
             );
             if (sid == "50") {
@@ -207,7 +205,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). uses the passed marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy) {
     Dictionary result;
 
     double tick_freq = cv::getTickFrequency();
@@ -235,23 +233,24 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     };
 
     // Intrinsics derived from the (downscaled) detection frame, so corners + K share one pixel space.
-    /*
+    
     float w = static_cast<float>(det_frame.cols);
     float h = static_cast<float>(det_frame.rows);
-
+    UtilityFunctions::print("pixel-width(godot):",w);
+    UtilityFunctions::print("pixel-height(godot):",h);
     
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
-        w, 0, w/2.0f,
-        0, w, h/2.0f,
+        fx, 0, cx,
+        0, fy, cy,
         0, 0, 1);
-    */
+    /*
     cv::Mat Kamera_matrix;
 
     if (current_camera_id == 50)
         Kamera_matrix = K_cam50;
     else
         Kamera_matrix = K_cam51;
-
+    */
     cv::Mat distort = cv::Mat::zeros(5, 1, CV_32F);
 
     std::vector<std::vector<cv::Point2f>> corners;
@@ -304,7 +303,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale,const float &fx, const float &fy,const float &cx,const float &cy) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -344,7 +343,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
     }
 
-    return detect_and_solve_all(gray, marker_size, downscale);
+    return detect_and_solve_all(gray, marker_size, downscale,fx,fy,cx,cy);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {
