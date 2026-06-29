@@ -113,7 +113,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
         }
         UtilityFunctions::print("count:", dist.count);
         UtilityFunctions::print("type:", dist.type);
-        UtilityFunctions::print(dist.data.f);
+        UtilityFunctions::print("ptr:",(void*)dist.data.f);
         UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
 
         ACameraMetadata_free(meta);
