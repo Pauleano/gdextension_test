@@ -40,6 +40,8 @@ OpenCVProcessor::~OpenCVProcessor() {}
 
 void OpenCVProcessor::init_quest_intrinsics() {
 
+    UtilityFunctions::print("init_quest_intrinsics CALLED");//debug print statement
+    
     ACameraManager *mgr = ACameraManager_create();
 
     ACameraIdList *idList = nullptr;
@@ -67,6 +69,11 @@ void OpenCVProcessor::init_quest_intrinsics() {
         // -------------------------
         // INTRINSIC MATRIX
         // -------------------------
+        UtilityFunctions::print(ACameraMetadata_getConstEntry(
+                meta,
+                ACAMERA_LENS_INTRINSIC_CALIBRATION,
+                &entry) == ACAMERA_OK && entry.count == 5);//debug print statement
+
         if (ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_INTRINSIC_CALIBRATION,
@@ -91,6 +98,10 @@ void OpenCVProcessor::init_quest_intrinsics() {
         // -------------------------
         // DISTORTION
         // -------------------------
+        UtilityFunctions::print(ACameraMetadata_getConstEntry(
+                meta,
+                ACAMERA_LENS_INTRINSIC_CALIBRATION,
+                &entry) == ACAMERA_OK && entry.count >= 5);//debug print statement
         if (ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_DISTORTION,
