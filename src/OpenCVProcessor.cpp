@@ -64,25 +64,23 @@ void OpenCVProcessor::init_quest_intrinsics() {
         if (ACameraManager_getCameraCharacteristics(mgr, id, &meta) != ACAMERA_OK)
             continue;
 
-        ACameraMetadata_const_entry entry;
+        ACameraMetadata_const_entry intr;
+        ACameraMetadata_const_entry dist;
 
         // -------------------------
         // INTRINSIC MATRIX
         // -------------------------
-        UtilityFunctions::print(ACameraMetadata_getConstEntry(
-                meta,
-                ACAMERA_LENS_INTRINSIC_CALIBRATION,
-                &entry) == ACAMERA_OK && entry.count == 5);//debug print statement
-
+        
+        
         if (ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_INTRINSIC_CALIBRATION,
-                &entry) == ACAMERA_OK && entry.count == 5)
+                &intr) == ACAMERA_OK && intr.count == 5)
         {
-            float fx = entry.data.f[0];
-            float fy = entry.data.f[1];
-            float cx = entry.data.f[2];
-            float cy = entry.data.f[3];
+            float fx = intr.data.f[0];
+            float fy = intr.data.f[1];
+            float cx = intr.data.f[2];
+            float cy = intr.data.f[3];
 
             K = (cv::Mat_<float>(3,3) <<
                 fx, 0,  cx,
@@ -90,28 +88,23 @@ void OpenCVProcessor::init_quest_intrinsics() {
                 0,  0,  1
             );
 
-            intrinsics_ready = true;
-
-            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str());
+            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str(), K);
         }
 
         // -------------------------
         // DISTORTION
         // -------------------------
-        UtilityFunctions::print(ACameraMetadata_getConstEntry(
-                meta,
-                ACAMERA_LENS_INTRINSIC_CALIBRATION,
-                &entry) == ACAMERA_OK && entry.count >= 5);//debug print statement
         if (ACameraMetadata_getConstEntry(
                 meta,
                 ACAMERA_LENS_DISTORTION,
-                &entry) == ACAMERA_OK && entry.count >= 5)
+                &dist) == ACAMERA_OK && dist.count >= 5)
         {
-            D = cv::Mat(1, entry.count, CV_32F);
+            D = cv::Mat(1, dist.count, CV_32F);
 
-            for (int j = 0; j < entry.count; j++)
-                D.at<float>(j) = entry.data.f[j];
+            for (int j = 0; j < dist.count; j++)
+                D.at<float>(j) = dist.data.f[j];
         }
+        UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str(), D);
 
         ACameraMetadata_free(meta);
     }
