@@ -30,6 +30,19 @@ var _result_markers: Dictionary = {}
 var _result_cam_xform: Transform3D
 var _has_result := false
 
+
+#stream image of quest to laptop via tcp
+const TCP_HOST := "127.0.0.1"
+const TCP_PORT := 7007			#view available ports with adb reverse --list
+
+var stream_peer: StreamPeerTCP
+var _tcp_reconnect_timer := 0.0
+var _last_tcp_status := -1
+var _tcp_send_timer := 0.0
+const TCP_SEND_INTERVAL := 0.01
+
+#######################################################################################################
+
 func _ready() -> void:
 	processor = OpenCVProcessor.new()
 
@@ -69,6 +82,9 @@ func _ready() -> void:
 	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 	_on_camera_feeds_updated()                          # in case a feed is already present
 
+	
+	_connect_tcp()
+	
 func _on_camera_feeds_updated() -> void:
 	if cam_texture != null:
 		return                                          # already initialised
@@ -97,8 +113,8 @@ func _on_camera_feeds_updated() -> void:
 	var formats := feed.get_formats()
 	for j in range(formats.size()):
 		print("feed format ", j, ": ", formats[j])
-	if formats.size() > 2:
-		feed.set_format(2, {})        # feed format:2 640x480 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
+	if formats.size() > 10:
+		feed.set_format(10, {})        # feed format:2 640x480 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
 	elif formats.size() > 0:
 		feed.set_format(0, {})
 
@@ -109,8 +125,11 @@ func _on_camera_feeds_updated() -> void:
 	cam_preview.texture = cam_texture
 	print("camera feeds: ", feed_count)
 
+####################################################################################################
 
 func _process(_delta: float) -> void:
+	_poll_tcp(_delta)
+	
 	if cam_texture == null:
 		return
 
@@ -137,6 +156,17 @@ func _process(_delta: float) -> void:
 	var img := cam_texture.get_image()
 	if img == null:
 		return
+	#print("image format: ",img.get_format()) #format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
+	
+	
+	
+	_tcp_send_timer += _delta
+	if _tcp_send_timer >= TCP_SEND_INTERVAL:
+		_tcp_send_timer = 0.0
+		if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
+			_send_frame_tcp(img)
+	
+		
 	var cap_cam_xform := xr_camera.global_transform     # head pose AT capture time, for world bake
 	_detect_mutex.lock()
 	var was_pending := _has_pending
@@ -164,8 +194,14 @@ func _detection_loop() -> void:
 			continue
 		# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
 		var t0 := Time.get_ticks_usec()
-		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, 0.05,1)
-		print("detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
+		var image_downscale_factor=0.2 #1 is original image, 0.5 means half width and half height
+		var aruco_patch_size=0.05 #in meters
+		var fx=867.243286132812*image_downscale_factor
+		var fy=867.243286132812*image_downscale_factor
+		var cx=642.726257324219*image_downscale_factor #approxiamte cx is fx/2
+		var cy=639.103088378906*image_downscale_factor #approxiamte cy is fy/2
+		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size,image_downscale_factor,fx,fy,cx,cy)
+		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
 		_detect_mutex.lock()
 		_result_markers = markers
 		_result_cam_xform = cam_xform
@@ -181,5 +217,62 @@ func _exit_tree() -> void:
 		_detect_sem.post()
 		_detect_thread.wait_to_finish()
 
+func _send_frame_tcp(img: Image) -> void:
+	if stream_peer == null:
+		return
+
+	stream_peer.poll()
+
+	if stream_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+		return
+
+	var bytes: PackedByteArray = img.get_data()
+
+	stream_peer.put_u32(img.get_width())
+	stream_peer.put_u32(img.get_height())
+	stream_peer.put_u32(img.get_format())
+	stream_peer.put_u32(bytes.size())
+
+	var err := stream_peer.put_data(bytes)
+	if err != OK:
+		print("TCP put_data error: ", err)
+	
+func _connect_tcp() -> void:
+	stream_peer = StreamPeerTCP.new()
+	stream_peer.big_endian = true
+
+	var err := stream_peer.connect_to_host(TCP_HOST, TCP_PORT)
+	print("TCP connect_to_host err: ", err)
+
+	if err != OK:
+		print("TCP connect_to_host failed immediately: ", err)
+
+
+func _poll_tcp(delta: float) -> void:
+	if stream_peer == null:
+		_connect_tcp()
+		return
+
+	stream_peer.poll()
+
+	var status := stream_peer.get_status()
+
+	if status != _last_tcp_status:
+		print("TCP status changed: ", _last_tcp_status, " -> ", status)
+		_last_tcp_status = status
+
+	if status == StreamPeerTCP.STATUS_CONNECTED:
+		_tcp_reconnect_timer = 0.0
+		return
+
+	if status == StreamPeerTCP.STATUS_CONNECTING:
+		return
+
+	if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
+		_tcp_reconnect_timer += delta
+		if _tcp_reconnect_timer >= 1.0:
+			_tcp_reconnect_timer = 0.0
+			print("TCP reconnecting...")
+			_connect_tcp()
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop com.example.godotcpptemplate
