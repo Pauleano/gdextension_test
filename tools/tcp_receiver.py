@@ -1,10 +1,16 @@
 import socket
 import cv2  
 import numpy as np
+import os
+
+save_dir = "tools/images"
+os.makedirs(save_dir, exist_ok=True)
 
 WIDTH = 1280
 HEIGHT = 1280
 
+#have to create a tcp connection on socket 7007
+#adb reverse tcp:7007 tcp:7007
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind(("0.0.0.0", 7007)) #alternative to 0.0.0.0 is 127.0.0.1
 s.listen(1)
@@ -21,6 +27,8 @@ def recvall(sock, size):
             return None
         data += packet
     return data
+
+image_num=0
 
 while True:
     print("waiting for 16-byte header...")
@@ -66,8 +74,20 @@ while True:
     print("showing frame")
     cv2.imshow("Quest Feed", img)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    k = cv2.waitKey(100) & 0xFF
+
+    if k  == ord('q'):
         break
+    elif k== ord('s'):
+
+        filename = os.path.join(save_dir, f"img{image_num}.jpg")
+        success = cv2.imwrite(filename, img)
+
+        if success:
+            print(f"image saved: {filename}")
+            image_num += 1
+        else:
+            print(f"could not save image: {filename}")
 
 comm_socket.close()
 s.close()

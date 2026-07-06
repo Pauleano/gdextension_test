@@ -251,7 +251,13 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     else
         Kamera_matrix = K_cam51;
     */
-    cv::Mat distort = cv::Mat::zeros(5, 1, CV_32F);
+    cv::Mat distort = (cv::Mat_<float>(5, 1) <<
+    -8.30483432e-02f,
+     9.82703836e-01f,
+     1.69836574e-03f,
+     4.92066863e-03f,
+    -4.12769790e+00f
+    );
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
