@@ -6,11 +6,12 @@
 //#include <godot_cpp/variant/transform3d.hpp> wird momentan nicht benötigt, da es von wo anders anscheinend schon reingezogen wird
 //#include <opencv2/objdetect/aruco_detector.hpp> falls error "incomplete type" auftauchen sollten 
 //for intrinsics
+#ifdef __ANDROID__
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraMetadata.h>
 #include <camera/NdkCameraMetadataTags.h>
 #include <android/log.h>
-
+#endif
 using namespace godot;
 
 void OpenCVProcessor::_bind_methods() {
@@ -41,7 +42,7 @@ OpenCVProcessor::~OpenCVProcessor() {}
 void OpenCVProcessor::init_quest_intrinsics() {
 
     UtilityFunctions::print("init_quest_intrinsics CALLED");//debug print statement
-    
+    #ifdef __ANDROID__
     ACameraManager *mgr = ACameraManager_create();
 
     ACameraIdList *idList = nullptr;
@@ -66,7 +67,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
 
         ACameraMetadata_const_entry intr;
         ACameraMetadata_const_entry dist;
-        
+        ACameraMetadata_const_entry entry;
 
         // -------------------------
         // INTRINSIC MATRIX
@@ -126,11 +127,48 @@ void OpenCVProcessor::init_quest_intrinsics() {
         UtilityFunctions::print("type:", dist.type);
         UtilityFunctions::print("getConst_entry for distortions:",test); //getConst_entry for distortions:-10004 means couldnt get distortion coefficients
         
+        if (ACameraMetadata_getConstEntry(
+            metadata,
+            ACAMERA_LENS_POSE_TRANSLATION,
+            &entry) == ACAMERA_OK) {
+            float tx = entry.data.f[0];
+            float ty = entry.data.f[1];
+            float tz = entry.data.f[2];
+            UtilityFunctions::print(tx);
+            UtilityFunctions::print(ty);
+            UtilityFunctions::print(tz);
+        }
+
+        if (ACameraMetadata_getConstEntry(
+                metadata,
+                ACAMERA_LENS_POSE_ROTATION,
+                &entry) == ACAMERA_OK) {
+            float qx = entry.data.f[0];
+            float qy = entry.data.f[1];
+            float qz = entry.data.f[2];
+            float qw = entry.data.f[3];
+            UtilityFunctions::print(qx);
+            UtilityFunctions::print(qy);
+            UtilityFunctions::print(qz);
+            UtilityFunctions::print(qw);
+        }
+
+    if (ACameraMetadata_getConstEntry(
+            metadata,
+            ACAMERA_LENS_POSE_REFERENCE,
+            &entry) == ACAMERA_OK) {
+        int pose_ref = entry.data.i32[0];
+        UtilityFunctions::print(pose_ref);
+    }
+
+
+
         ACameraMetadata_free(meta);
     }
 
     ACameraManager_deleteCameraIdList(idList);
     ACameraManager_delete(mgr);
+    #endif
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const String &res_path) {

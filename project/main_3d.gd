@@ -196,10 +196,10 @@ func _detection_loop() -> void:
 		var t0 := Time.get_ticks_usec()
 		var image_downscale_factor=0.5 #1 is original image, 0.5 means half width and half height
 		var aruco_patch_size=0.1 #in meters
-		var fx=866.02136372*image_downscale_factor
-		var fy=866.58125523*image_downscale_factor
-		var cx=653.27796095*image_downscale_factor #approxiamte cx is fx/2
-		var cy=644.12183891*image_downscale_factor #approxiamte cy is fy/2
+		var fx=877.06583568*image_downscale_factor
+		var fy=878.33004836*image_downscale_factor
+		var cx=645.36226952*image_downscale_factor #approxiamte cx is fx/2
+		var cy=642.24557861*image_downscale_factor #approxiamte cy is fy/2
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size,image_downscale_factor,fx,fy,cx,cy)
 		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
 		_detect_mutex.lock()
