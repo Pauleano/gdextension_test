@@ -17,7 +17,7 @@ using namespace godot;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image, DEFVAL(0.7f));
+    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale", "fx", "fy", "cx", "cy", "lens_rotation", "lens_translation"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
 }
@@ -246,8 +246,19 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). uses the passed marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const Quaternion &lens_rotation,const Vector3 &lens_translation) {
     Dictionary result;
+
+    // Physical passthrough-camera offset from the head-tracked reference (XRCamera3D), taken from
+    // the Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION and passed in from GDScript. solvePnP
+    // returns the marker pose in the physical CAMERA frame, so we pre-multiply by this lens pose to
+    // re-express each marker relative to the head reference; GDScript then bakes it to world space
+    // with the head transform sampled at capture time. Identity rotation + zero translation makes
+    // this a no-op, so the pose is unchanged until real values are supplied.
+    // NOTE: if markers land in the wrong place, the axis convention between the Android lens pose
+    // and Godot is the knob -- try the conjugate quaternion / flipped translation signs (easiest to
+    // do where these are constructed in GDScript).
+    Transform3D lens_pose(Basis(lens_rotation), lens_translation);
 
     double tick_freq = cv::getTickFrequency();
 
@@ -342,7 +353,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
             (-tvec.at<double>(2))
         );
 
-        result[ids[i]] = Transform3D(basis, origin);
+        result[ids[i]] = lens_pose * Transform3D(basis, origin);
     }
 
     UtilityFunctions::print("solvePnP total=", solve_ms, "ms  (", (int)ids.size(), " markers)");
@@ -350,7 +361,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale,const float &fx, const float &fy,const float &cx,const float &cy) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale,const float &fx, const float &fy,const float &cx,const float &cy,const Quaternion &lens_rotation,const Vector3 &lens_translation) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -390,7 +401,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
     }
 
-    return detect_and_solve_all(gray, marker_size, downscale,fx,fy,cx,cy);
+    return detect_and_solve_all(gray, marker_size, downscale,fx,fy,cx,cy,lens_rotation,lens_translation);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {

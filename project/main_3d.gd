@@ -200,7 +200,13 @@ func _detection_loop() -> void:
 		var fy=878.33004836*image_downscale_factor
 		var cx=645.36226952*image_downscale_factor #approxiamte cx is fx/2
 		var cy=642.24557861*image_downscale_factor #approxiamte cy is fy/2
-		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size,image_downscale_factor,fx,fy,cx,cy)
+		# Physical passthrough-camera offset from the head-tracked reference (XRCamera3D), from the
+		# Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION. init_quest_intrinsics() prints these on
+		# the C++ side -- paste the values you see in the device logs here. 
+		var lens_rotation := Quaternion(-0.99519097805023,0.00269138417207, 0.00294101587497, 0.09787271916866)   #quaternion(x,y,z,w) from device logs  
+		var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378)       # Vector3(tx, ty, tz) from device logs
+		
+		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size,image_downscale_factor,fx,fy,cx,cy,lens_rotation,lens_translation)
 		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
 		_detect_mutex.lock()
 		_result_markers = markers
