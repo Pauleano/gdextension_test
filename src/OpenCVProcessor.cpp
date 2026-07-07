@@ -128,7 +128,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
         UtilityFunctions::print("getConst_entry for distortions:",test); //getConst_entry for distortions:-10004 means couldnt get distortion coefficients
         
         if (ACameraMetadata_getConstEntry(
-            metadata,
+            meta,
             ACAMERA_LENS_POSE_TRANSLATION,
             &entry) == ACAMERA_OK) {
             float tx = entry.data.f[0];
@@ -140,7 +140,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
         }
 
         if (ACameraMetadata_getConstEntry(
-                metadata,
+                meta,
                 ACAMERA_LENS_POSE_ROTATION,
                 &entry) == ACAMERA_OK) {
             float qx = entry.data.f[0];
@@ -154,7 +154,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
         }
 
     if (ACameraMetadata_getConstEntry(
-            metadata,
+            meta,
             ACAMERA_LENS_POSE_REFERENCE,
             &entry) == ACAMERA_OK) {
         int pose_ref = entry.data.i32[0];
