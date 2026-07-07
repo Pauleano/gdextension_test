@@ -134,6 +134,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float tx = entry.data.f[0];
             float ty = entry.data.f[1];
             float tz = entry.data.f[2];
+            UtilityFunctions::print("translation (x,y,z):");
             UtilityFunctions::print(tx);
             UtilityFunctions::print(ty);
             UtilityFunctions::print(tz);
@@ -147,6 +148,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float qy = entry.data.f[1];
             float qz = entry.data.f[2];
             float qw = entry.data.f[3];
+            UtilityFunctions::print("rotation quaternion (x,y,z,w): ");
             UtilityFunctions::print(qx);
             UtilityFunctions::print(qy);
             UtilityFunctions::print(qz);
@@ -158,6 +160,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             ACAMERA_LENS_POSE_REFERENCE,
             &entry) == ACAMERA_OK) {
         int pose_ref = entry.data.i32[0];
+        UtilityFunctions::print("LENS_POSE_REFERENCE: ");
         UtilityFunctions::print(pose_ref);
     }
 
