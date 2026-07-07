@@ -3,6 +3,12 @@ extends Node3D
 var processor: OpenCVProcessor
 var marker_nodes: Dictionary = {}
 
+# Physical side length of the ArUco marker, in meters. Single source of truth: used as the
+# solvePnP marker size (sets the pose's metric scale) AND as the rendered cuboid's side length
+# (see _ready), so the two can never disagree.
+var aruco_patch_size := 0.1
+
+
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
 # CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
 # instantiate via ClassDB so the script still parses on Android, where the
@@ -29,6 +35,16 @@ var _has_pending := false
 var _result_markers: Dictionary = {}
 var _result_cam_xform: Transform3D
 var _has_result := false
+
+# --- Capture-latency compensation ---
+# The Image get_image() returns is OLDER than "now": sensor -> ISP -> CameraServer texture takes
+# 1-2 camera frames (~30-100ms). Pairing those old pixels with the LIVE head pose bakes an error
+# proportional to head speed, so a fresh detection first "drags" with the head, then settles.
+# We keep a short timestamped head-pose history and pair each frame with the pose from
+# CAMERA_LATENCY_MS ago instead. Tune on device: patch still drags WITH the head -> raise;
+# patch lags behind the real marker during motion -> lower.
+const CAMERA_LATENCY_MS := 50.0
+var _pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
 
 #stream image of quest to laptop via tcp
@@ -60,7 +76,14 @@ func _ready() -> void:
 	# head and "swims" when you move. Anchored in XROrigin3D world space instead, we bake the
 	# pose once at detection time (see _process) and it stays fixed on the real marker.
 	for id in marker_nodes:
-		marker_nodes[id].reparent(xr_origin, false) #reparent(new_parent: Node, keep_global_transform: bool = false)
+		var patch: Node3D = marker_nodes[id]
+		# Size the rendered cuboid to the real marker: x/y = aruco_patch_size; keep the authored
+		# thickness (z). The BoxMesh is a unit cube and the baked pose is rigid (scale 1), so the
+		# mesh's local scale IS its size in meters.
+		for c in patch.get_children():
+			if c is MeshInstance3D:
+				c.scale = Vector3(aruco_patch_size, aruco_patch_size, c.scale.z)
+		patch.reparent(xr_origin, false)
 
 	# Spin up the detection worker. processor and marker_nodes are ready by now; the loop only
 	# needs the processor (no scene-tree access), so it is safe to start before any feed exists.
@@ -167,7 +190,14 @@ func _process(_delta: float) -> void:
 			_send_frame_tcp(img)
 	
 		
-	var cap_cam_xform := xr_camera.global_transform     # head pose AT capture time, for world bake
+	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~CAMERA_LATENCY_MS old
+	# (passthrough pipeline), so look that far back in the pose history (see _head_pose_at).
+	var now_usec := Time.get_ticks_usec()
+	_pose_history.append([now_usec, xr_camera.global_transform])
+	while _pose_history.size() > 1 and _pose_history[0][0] < now_usec - 500_000:
+		_pose_history.pop_front()
+	var cap_cam_xform := _head_pose_at(now_usec - int(CAMERA_LATENCY_MS * 1000.0))
+
 	_detect_mutex.lock()
 	var was_pending := _has_pending
 	_pending_image = img                                # overwrites any unconsumed frame -> frame drop
@@ -195,17 +225,22 @@ func _detection_loop() -> void:
 		# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
 		var t0 := Time.get_ticks_usec()
 		var image_downscale_factor=0.5 #1 is original image, 0.5 means half width and half height
-		var aruco_patch_size=0.1 #in meters
 		var fx=877.06583568*image_downscale_factor
 		var fy=878.33004836*image_downscale_factor
 		var cx=645.36226952*image_downscale_factor #approxiamte cx is fx/2
 		var cy=642.24557861*image_downscale_factor #approxiamte cy is fy/2
-		# Physical passthrough-camera offset from the head-tracked reference (XRCamera3D), from the
-		# Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION. init_quest_intrinsics() prints these on
-		# the C++ side -- paste the values you see in the device logs here. 
-		var lens_rotation := Quaternion(-0.99519097805023,0.00269138417207, 0.00294101587497, 0.09787271916866)   #quaternion(x,y,z,w) from device logs  
-		var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378)       # Vector3(tx, ty, tz) from device logs
-		
+		# Physical passthrough-camera pose relative to the gyro/IMU reference, from the Quest's
+		# ACAMERA_LENS_POSE_ROTATION / _TRANSLATION (LENS_POSE_REFERENCE == GYROSCOPE).
+		# The raw quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg X-flip
+		# PLUS the camera's real ~11deg pitch. The C++ marker pose already contains that same 180deg
+		# flip (its negate-Y/Z change of basis), so multiply by Quaternion(1,0,0,0) (=180deg about X)
+		# to cancel the flip and keep ONLY the physical mounting tilt.
+		# The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
+		# camera axes -> use raw values, no sign flips.
+		var lens_q_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
+		var lens_rotation := (lens_q_raw * Quaternion(1, 0, 0, 0)).inverse() # if visibly worse, try appending .inverse()
+		var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378) # raw LENS_POSE_TRANSLATION
+
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size,image_downscale_factor,fx,fy,cx,cy,lens_rotation,lens_translation)
 		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
 		_detect_mutex.lock()
@@ -213,6 +248,20 @@ func _detection_loop() -> void:
 		_result_cam_xform = cam_xform
 		_has_result = true
 		_detect_mutex.unlock()
+
+
+# Newest recorded head pose that is not newer than t_usec (nearest-older sample; at 72fps the
+# history has ~14ms granularity). Falls back to the oldest entry (or the live pose) while the
+# history is still filling up.
+func _head_pose_at(t_usec: int) -> Transform3D:
+	for i in range(_pose_history.size() - 1, -1, -1):
+		if _pose_history[i][0] <= t_usec:
+			return _pose_history[i][1]
+	if _pose_history.is_empty():
+		return xr_camera.global_transform
+	return _pose_history[0][1]
+
+
 
 func _exit_tree() -> void:
 	# Wake the worker out of its wait() and join it, so the thread doesn't outlive the scene.
