@@ -92,6 +92,9 @@ CMakeUserPresets.json
 *.apk
 *.aab
 
+# Godot export credentials (keystore paths/passwords — per machine, never commit)
+project/export_credentials.cfg
+
 # OpenCV (lokaler Build-Input, via Conan verwaltet — nicht eingecheckt)
 opencv/
 
