@@ -9,7 +9,7 @@ import sysconfig
 from methods import print_error
 
 
-libname = "snopek_tut"
+libname = "opencv_aruco"
 projectdir = "project"
 
 localEnv = Environment(tools=["default"], PLATFORM="")
@@ -133,7 +133,7 @@ if env["platform"] == "windows":
         subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
                         "--build=missing"] + settings, check=True)
     merge_conan_deps(env, conan_out)
-    library = env.SharedLibrary(  # snopek_tut.windows.<target>[.double].<arch>.dll (kein "lib")
+    library = env.SharedLibrary(  # opencv_aruco.windows.<target>[.double].<arch>.dll (kein "lib")
         "{}/bin/windows/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
     )
@@ -147,7 +147,7 @@ elif env["platform"] == "linux":
         subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
                         "--build=missing"] + settings, check=True)
     merge_conan_deps(env, conan_out)
-    library = env.SharedLibrary(  # libsnopek_tut.linux.<target>[.double].<arch>.so
+    library = env.SharedLibrary(  # libopencv_aruco.linux.<target>[.double].<arch>.so
         "{}/bin/linux/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
     )
@@ -169,7 +169,7 @@ elif env["platform"] == "android":
     # OpenCV's videoio Android backend references the Camera2 NDK (libcamera2ndk/libmediandk);
     # without these the .so fails to load on device with "undefined symbol ACameraManager_create".
     env.Append(LIBS=["camera2ndk", "mediandk", "android", "log"])
-    library = env.SharedLibrary(  # libsnopek_tut.android.<target>[.double].<arch>.so
+    library = env.SharedLibrary(  # libopencv_aruco.android.<target>[.double].<arch>.so
         "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
     )
