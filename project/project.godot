@@ -14,10 +14,14 @@ compatibility/default_parent_skeleton_in_mesh_instance_3d=true
 
 [application]
 
-config/name="godot cpp template"
+config/name="OpenCV ArUco"
 run/main_scene="uid://catn06b43r1ce"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/aruco_export_guard/plugin.cfg")
 
 [rendering]
 

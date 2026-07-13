@@ -17,6 +17,25 @@ project/bin/macos/*
 project/bin/windows/*
 !project/bin/windows/.gitkeep
 !project/bin/*.gdextension
+
+# CMake's root bin/ build output (keep the empty platform dirs via .gitkeep)
+bin/*
+!bin/android
+bin/android/*
+!bin/android/.gitkeep
+!bin/linux
+bin/linux/*
+!bin/linux/.gitkeep
+!bin/macos
+bin/macos/*
+!bin/macos/.gitkeep
+!bin/windows
+bin/windows/*
+!bin/windows/.gitkeep
+
+# Python bytecode cache
+__pycache__/
+
 .sconsign*.dblite
 
 # Ignore custom.py
@@ -72,6 +91,9 @@ CMakeUserPresets.json
 # Android export artifacts
 *.apk
 *.aab
+
+# Godot export credentials (keystore paths/passwords — per machine, never commit)
+project/export_credentials.cfg
 
 # OpenCV (lokaler Build-Input, via Conan verwaltet — nicht eingecheckt)
 opencv/
