@@ -244,9 +244,9 @@ The Godot editor does **not** build the GDExtension `.so` for Android automatica
 
 ---
 
-## 4. Track 1 — Set up WSL/Linux build host
+## 3. Track 1 — Set up WSL/Linux build host
 
-### 4.1 Check whether WSL is installed
+### 3.1 Check whether WSL is installed
 
 Open PowerShell on Windows:
 
@@ -254,7 +254,7 @@ Open PowerShell on Windows:
 wsl --version
 ```
 
-### 4.2 List available Linux distributions
+### 3.2 List available Linux distributions
 
 ```powershell
 wsl --list --online
@@ -262,7 +262,7 @@ wsl --list --online
 
 The recorded setup showed `Ubuntu-26.04` as available.
 
-### 4.3 Install Ubuntu in WSL
+### 3.3 Install Ubuntu in WSL
 
 ```powershell
 wsl --install -d Ubuntu-26.04
@@ -277,7 +277,7 @@ password: <your-own-password>
 
 Do not commit real passwords or machine-specific credentials to the repository.
 
-### 4.4 Install base Linux build tools
+### 3.4 Install base Linux build tools
 
 Open the Ubuntu WSL shell:
 
@@ -311,16 +311,16 @@ Tool purpose:
 
 ---
 
-## 5. Install Android command-line tools inside WSL
+## 4. Install Android command-line tools inside WSL
 
-### 5.1 Create Android SDK folder
+### 4.1 Create Android SDK folder
 
 ```bash
 mkdir -p "$HOME/Android/sdk/cmdline-tools"
 cd "$HOME/Android"
 ```
 
-### 5.2 Download Android command-line tools
+### 4.2 Download Android command-line tools
 
 ```bash
 wget -O commandlinetools-linux.zip \
@@ -333,7 +333,7 @@ Unzip:
 unzip commandlinetools-linux.zip
 ```
 
-### 5.3 Move command-line tools into the correct SDK layout
+### 4.3 Move command-line tools into the correct SDK layout
 
 The correct final layout is:
 
@@ -367,7 +367,7 @@ mv cmdline-tools/* .
 rmdir cmdline-tools
 ```
 
-### 5.4 Add Android SDK tools to WSL PATH
+### 4.4 Add Android SDK tools to WSL PATH
 
 Append environment variables to `~/.bashrc`:
 
@@ -387,7 +387,7 @@ which sdkmanager
 sdkmanager --version
 ```
 
-### 5.5 Install Android SDK platform tools, platform 34, and build-tools 34
+### 4.5 Install Android SDK platform tools, platform 34, and build-tools 34
 
 ```bash
 sdkmanager \
@@ -396,7 +396,7 @@ sdkmanager \
   "build-tools;34.0.0"
 ```
 
-### 5.6 Install Android NDK 23.2.8568313 inside WSL
+### 4.6 Install Android NDK 23.2.8568313 inside WSL
 
 ```bash
 sdkmanager "ndk;23.2.8568313"
@@ -418,9 +418,9 @@ This WSL NDK is used for compiling the Android `.so`.
 
 ---
 
-## 6. Track 2 — Build the GDExtension `.so` for Android arm64
+## 5. Track 2 — Build the GDExtension `.so` for Android arm64
 
-### 6.1 Clone the repository
+### 5.1 Clone the repository
 
 Inside WSL:
 
@@ -437,7 +437,7 @@ If the repository was cloned without submodules:
 git submodule update --init --recursive
 ```
 
-### 6.2 Install Conan, if needed
+### 5.2 Install Conan, if needed
 
 The `SConstruct` can install Conan if it is missing. Manual installation is optional.
 
@@ -455,7 +455,7 @@ Verify:
 conan --version
 ```
 
-### 6.3 Create Conan Android arm64 host profile
+### 5.3 Create Conan Android arm64 host profile
 
 Create the profile folder:
 
@@ -489,7 +489,7 @@ Important details:
 - `compiler.libcxx=c++_static` was the recommended starting point.
 - Switch to `c++_shared` only if you hit duplicate-symbol or exception-unwinding errors at runtime.
 
-### 6.4 Export the Conan host profile variable
+### 5.4 Export the Conan host profile variable
 
 For the current shell:
 
@@ -511,7 +511,7 @@ echo "$CONAN_HOST_PROFILE"
 cat "$CONAN_HOST_PROFILE"
 ```
 
-### 6.5 Build the Android arm64 GDExtension library
+### 5.5 Build the Android arm64 GDExtension library
 
 From the repository root:
 
@@ -525,7 +525,7 @@ Expected output path:
 project/bin/android/libopencv_aruco.android.template_debug.arm64.so
 ```
 
-### 6.6 Verify the `.so`
+### 5.6 Verify the `.so`
 
 Optional but useful:
 
@@ -541,7 +541,7 @@ Check the entry symbol:
 nm -D project/bin/android/libopencv_aruco.android.template_debug.arm64.so | grep opencv_aruco_library_init
 ```
 
-### 6.7 Copy the `.so` into the Godot project used by Windows
+### 5.7 Copy the `.so` into the Godot project used by Windows
 
 copy:
 
@@ -552,7 +552,7 @@ Windows: <repo>\project\bin\android\libopencv_aruco.android.template_debug.arm64
 
 ---
 
-## 7. Track 3 — Configure Godot on Windows for Android/OpenXR export
+## 6. Track 3 — Configure Godot on Windows for Android/OpenXR export
 
 Important distinction:
 
@@ -561,7 +561,7 @@ Important distinction:
 - Godot on Windows needs Windows paths for Java and Android SDK.
 
 
-### 7.1 Install Windows-side JDK 17
+### 6.1 Install Windows-side JDK 17
 
 The recorded setup used Eclipse Adoptium JDK 17.
 
@@ -573,7 +573,7 @@ C:/Users/<WindowsUser>/AppData/Local/Programs/Eclipse Adoptium/jdk-17.x.x-hotspo
 
 The path must point to the JDK home folder containing `bin/java.exe`.
 
-### 7.2 Install Android Studio and Windows Android SDK/NDK
+### 6.2 Install Android Studio and Windows Android SDK/NDK
 
 Install Android Studio on Windows.
 
@@ -600,7 +600,7 @@ C:/Users/<WindowsUser>/AppData/Local/Android/Sdk/ndk/23.2.8568313
 
 Using the same NDK version family in WSL and Windows reduces ABI/toolchain mismatch risk.
 
-### 7.3 Install Android build template in Godot
+### 6.3 Install Android build template in Godot
 
 Open the project in the Windows Godot editor.
 
@@ -621,7 +621,7 @@ After installation, the project should contain:
 project/android/build/
 ```
 
-### 7.4 Configure Android export paths in Godot
+### 6.4 Configure Android export paths in Godot
 
 In Godot:
 
@@ -641,7 +641,7 @@ C:/Users/<WindowsUser>/AppData/Local/Android/Sdk
 
 Do not use WSL paths here. Paths such as `//wsl.localhost/...` caused problems in the recorded setup.
 
-### 7.5 Install the OpenXR Vendors plugin 
+### 6.5 Install the OpenXR Vendors plugin 
 
 The plugin should already be present in the repository. If not:
 
@@ -659,7 +659,7 @@ The plugin is placed in:
 project/addons/
 ```
 
-### 7.6 Export the APK
+### 6.6 Export the APK
 
 In Godot:
 
@@ -677,12 +677,12 @@ Alternative: use Godot's remote deploy function once the Quest is connected via 
 
 ---
 
-## 8. Track 4 — Set up Quest 3 and sideload APK
+## 7. Track 4 — Set up Quest 3 and sideload APK
 
 The used Quest 3 was already in developer mode.
 
 
-### 8.1 Connect Quest 3 via USB-C and authorize debugging
+### 7.1 Connect Quest 3 via USB-C and authorize debugging
 
 Connect the Quest 3 to the Windows PC using USB-C.
 
@@ -698,7 +698,7 @@ If available, enable:
 Always allow from this computer
 ```
 
-### 8.3 Verify ADB device connection on Windows
+### 7.2 Verify ADB device connection on Windows
 
 In PowerShell:
 
@@ -716,7 +716,7 @@ List of devices attached
 
 If the device shows as `unauthorized`, put on the headset and accept the debugging prompt.
 
-### 8.4 Install the APK manually
+### 7.3 Install the APK manually
 
 If you exported an APK manually:
 
