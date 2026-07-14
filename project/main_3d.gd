@@ -21,8 +21,10 @@ var cam_texture: CameraTexture
 # exposure) of every frame, so the head pose can be looked up at the true capture time.
 var android_camera: AndroidCamera
 var _android_cam_started := false
-var _cam_clock_offset_ns := 0          # camera clock ns - Godot ticks ns (get_clock_offset_nanos)
-var _frame_info_logged := false
+var _cam_clock_offset_ns := 0          # camera timestamp clock ns - Godot ticks ns
+var _cam_ts_realtime := false          # feed stamps on boottime ("realtime") vs CLOCK_MONOTONIC ("unknown")
+var _cam_frame_count := 0
+var _cam_fallback_count := 0           # frames whose timestamp failed the plausibility guard
 var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 @onready var xr_origin: XROrigin3D = $XROrigin3D
@@ -53,6 +55,15 @@ var _worker_has_result := false
 # On Android the plugin supplies the true sensor timestamp of every frame; CAMERA_LATENCY_MS is
 # only the fallback guess for the desktop CameraServer path, where no timestamp exists.
 const CAMERA_LATENCY_MS := 50.0
+
+# Residual timing bias of the pose lookup on the Android path, in ms; positive = use an OLDER
+# head pose. The sensor timestamp removes the VARIABLE pipeline delay, but two small static
+# offsets remain unknowable from GDScript: the head poses Godot reports are OpenXR poses
+# PREDICTED for the upcoming display time (~1-3 frame periods ahead of _process), and the clock
+# base of an "unknown" timestamp_source is only typically monotonic. Tune on device like
+# CAMERA_LATENCY_MS before: patch drags WITH the head during motion -> raise; patch lags
+# BEHIND the real marker -> lower (may go negative).
+const POSE_LOOKUP_BIAS_MS := 0.0
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
@@ -181,9 +192,6 @@ func _on_permission_result(_permission: String, granted: bool) -> void:
 
 func _start_android_camera() -> void:
 	_android_cam_started = true
-	# Camera timestamps are on SystemClock.elapsedRealtimeNanos(); this offset maps them onto
-	# Time.get_ticks_usec(), the clock the head-pose history is stamped with.
-	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos()
 	# Pick the LEFT passthrough camera ("50"): the hardcoded intrinsics + lens pose in
 	# _detection_loop belong to it. Fall back to any world-facing feed on non-Quest devices.
 	var cam_id := ""
@@ -198,7 +206,17 @@ func _start_android_camera() -> void:
 			if cameras[id].get("facing", "") == "back":
 				cam_id = id
 				break
-	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id, "'")
+	# Map camera timestamps onto Time.get_ticks_usec(), the clock the head-pose history is
+	# stamped with. WHICH camera clock to calibrate against depends on the feed:
+	# "realtime" = boottime (elapsedRealtimeNanos); "unknown" (Quest passthrough) = typically
+	# CLOCK_MONOTONIC, the very clock Godot's ticks run on. Using the boottime offset for a
+	# monotonic feed is off by the headset's accumulated doze time since boot -- a silent,
+	# run-dependent bias that made patches lag behind head motion.
+	_cam_ts_realtime = str(cameras.get(cam_id, {}).get("timestamp_source", "unknown")) == "realtime"
+	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
+			else android_camera.get_monotonic_clock_offset_nanos()
+	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id,
+			"' (timestamp clock: ", "realtime" if _cam_ts_realtime else "monotonic", ")")
 	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
 	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
 	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
@@ -206,21 +224,27 @@ func _start_android_camera() -> void:
 # Runs on the main thread (plugin signals are marshalled onto the engine loop). data is the
 # tight-packed Y plane; timestamp_ns is the sensor timestamp (start of exposure) of THIS frame.
 func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: int, height: int) -> void:
-	# Sensor timestamp -> Godot clock. If the result is implausible (camera clock is not the
-	# realtime clock, or the offset went stale across a headset doze), resample the offset once
-	# and fall back to the fixed-latency guess if it still disagrees.
+	# Sensor timestamp -> Godot clock. If the result is implausible (unexpected clock base, or
+	# the offset went stale across a headset doze), resample the offset once and fall back to
+	# the fixed-latency guess if it still disagrees.
 	var now_usec := Time.get_ticks_usec()
 	var cap_usec := (timestamp_ns - _cam_clock_offset_ns) / 1000
 	if cap_usec > now_usec or now_usec - cap_usec > 500_000:
-		_cam_clock_offset_ns = android_camera.get_clock_offset_nanos()
+		_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
+				else android_camera.get_monotonic_clock_offset_nanos()
 		cap_usec = (timestamp_ns - _cam_clock_offset_ns) / 1000
 		if cap_usec > now_usec or now_usec - cap_usec > 500_000:
+			_cam_fallback_count += 1
 			cap_usec = now_usec - int(CAMERA_LATENCY_MS * 1000.0)
+	var lag_ms := (now_usec - cap_usec) / 1000.0
+	cap_usec -= int(POSE_LOOKUP_BIAS_MS * 1000.0)
 
-	if not _frame_info_logged:
-		_frame_info_logged = true
-		print("AndroidCamera first frame: ", width, "x", height,
-				" sensor->delivery lag=", (now_usec - cap_usec) / 1000.0, "ms")
+	_cam_frame_count += 1
+	if _cam_frame_count == 1 or _cam_frame_count % 300 == 0:
+		print("AndroidCamera frame ", _cam_frame_count, ": ", width, "x", height,
+				" sensor->delivery lag=", lag_ms, "ms",
+				" clock=", "realtime" if _cam_ts_realtime else "monotonic",
+				" fallbacks=", _cam_fallback_count)
 
 	var img := Image.create_from_data(width, height, false, Image.FORMAT_L8, data)
 

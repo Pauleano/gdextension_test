@@ -114,16 +114,29 @@ func get_current_timestamp_nanos() -> int:
 
 	return java_interface.getCurrentTimestampNanos()
 
-## Offset between Godot's clock and the camera timestamp clock, such that
+## Offset between Godot's clock and the boottime clock (elapsedRealtimeNanos), such that
 ##     Time.get_ticks_usec() * 1000 + offset  ≈  frame timestamp_ns
-## Sample once (or occasionally) and use it to place camera frames on the same
-## timeline as engine-side data such as a camera-pose stream.
+## Valid for feeds whose "timestamp_source" is "realtime". Sample once (or occasionally)
+## and use it to place camera frames on the same timeline as engine-side data such as a
+## camera-pose stream. For "unknown" feeds see [method get_monotonic_clock_offset_nanos].
 func get_clock_offset_nanos() -> int:
 	if not is_instance_valid(java_interface):
 		_initialize_java_interface()
 
 	var godot_usec := Time.get_ticks_usec()
 	var camera_ns: int = java_interface.getCurrentTimestampNanos()
+	return camera_ns - godot_usec * 1000
+
+## Same as [method get_clock_offset_nanos] but against CLOCK_MONOTONIC (System.nanoTime),
+## the clock feeds with "timestamp_source": "unknown" typically stamp frames on. Godot's
+## Time.get_ticks_usec() is itself monotonic, so this offset is exact and drift-free for
+## such feeds, while the boottime offset would be wrong by the device's total doze time.
+func get_monotonic_clock_offset_nanos() -> int:
+	if not is_instance_valid(java_interface):
+		_initialize_java_interface()
+
+	var godot_usec := Time.get_ticks_usec()
+	var camera_ns: int = java_interface.getCurrentMonotonicNanos()
 	return camera_ns - godot_usec * 1000
 
 ## Starts streaming camera frames (via camera_frame signal) with given parameters.
