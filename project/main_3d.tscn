@@ -7,23 +7,26 @@
 
 [node name="main3d" type="Node3D" unique_id=327546220]
 script = ExtResource("1_wiwsh")
+aruco_patch_size = null
 
 [node name="XROrigin3D" type="XROrigin3D" parent="." unique_id=1743576496]
 script = ExtResource("2_xr")
 
 [node name="XRCamera3D" type="XRCamera3D" parent="XROrigin3D" unique_id=1388799716]
 
-[node name="aruco_patch0" type="Node3D" parent="XROrigin3D/XRCamera3D" unique_id=1968016531]
+[node name="OpenXRMetaEnvironmentDepth" type="OpenXRMetaEnvironmentDepth" parent="XROrigin3D/XRCamera3D" unique_id=104270219]
+
+[node name="aruco_patch0" type="Node3D" parent="XROrigin3D" unique_id=1968016531]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/XRCamera3D/aruco_patch0" unique_id=297015256]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/aruco_patch0" unique_id=297015256]
 transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
 mesh = SubResource("BoxMesh_wiwsh")
 
-[node name="aruco_patch1" type="Node3D" parent="XROrigin3D/XRCamera3D" unique_id=603516852]
+[node name="aruco_patch1" type="Node3D" parent="XROrigin3D" unique_id=603516852]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -0.5)
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/XRCamera3D/aruco_patch1" unique_id=656717756]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="XROrigin3D/aruco_patch1" unique_id=656717756]
 transform = Transform3D(0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.01, 0, 0, 0)
 mesh = SubResource("BoxMesh_wiwsh")
 

@@ -17,7 +17,7 @@ using namespace godot;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale", "fx", "fy", "cx", "cy", "lens_rotation", "lens_translation"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
+    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
 }
@@ -246,7 +246,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). uses the passed marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const Quaternion &lens_rotation,const Vector3 &lens_translation) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose) {
     Dictionary result;
 
     // Physical passthrough-camera offset from the head-tracked reference (XRCamera3D), taken from
@@ -257,8 +257,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     // this a no-op, so the pose is unchanged until real values are supplied.
     // NOTE: if markers land in the wrong place, the axis convention between the Android lens pose
     // and Godot is the knob -- try the conjugate quaternion / flipped translation signs (easiest to
-    // do where these are constructed in GDScript).
-    Transform3D lens_pose(Basis(lens_rotation), lens_translation);
+    // do where lens_pose is constructed in GDScript). An identity Transform3D makes this a no-op.
 
     double tick_freq = cv::getTickFrequency();
 
@@ -303,13 +302,8 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     else
         Kamera_matrix = K_cam51;
     */
-    cv::Mat distort = (cv::Mat_<float>(5, 1) <<
-    -0.0088707,
-     0.02728771,
-     0.00099143,
-     0.00132044,
-    0.02087528
-    );
+    // Distortion coefficients are supplied by the caller and passed straight to solvePnP.
+    // An empty Mat is valid and means "no distortion".
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
@@ -361,7 +355,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale,const float &fx, const float &fy,const float &cx,const float &cy,const Quaternion &lens_rotation,const Vector3 &lens_translation) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -401,7 +395,25 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
     }
 
-    return detect_and_solve_all(gray, marker_size, downscale,fx,fy,cx,cy,lens_rotation,lens_translation);
+    // Unpack the packed Godot inputs: intrinsics = (fx, fy, cx, cy); distortion = OpenCV distCoeffs.
+    float fx = (float)intrinsics.x;
+    float fy = (float)intrinsics.y;
+    float cx = (float)intrinsics.z;
+    float cy = (float)intrinsics.w;
+
+    // Copy the distortion vector into a column Mat (CV_32F, to match the camera matrix). An empty
+    // array leaves `distort` empty, which solvePnP treats as zero distortion.
+    cv::Mat distort;
+    int dist_n = (int)distortion.size();
+    if (dist_n > 0) {
+        distort = cv::Mat(dist_n, 1, CV_32F);
+        const double *dp = distortion.ptr();
+        for (int j = 0; j < dist_n; ++j) {
+            distort.at<float>(j) = (float)dp[j];
+        }
+    }
+
+    return detect_and_solve_all(gray, marker_size, downscale, fx, fy, cx, cy, distort, lens_pose);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {

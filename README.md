@@ -154,6 +154,69 @@ conanfile.py
 
 ---
 
+## Prerequisites
+
+Before running `scons` on a fresh machine, make sure the following are installed. The build script installs Conan automatically and auto-detects a Conan profile, but it does **not** install the compiler, Python, SCons, CMake, or the `godot-cpp` submodule — those must exist beforehand.
+
+### Common to all platforms
+
+| Requirement | Why it is needed | Check | How to install |
+|---|---|---|---|
+| Git | Clone the repository and initialize the `godot-cpp` submodule. | `git --version` | Win: `winget install Git.Git` · macOS: `brew install git` · Linux: `sudo apt install git` |
+| Python 3 | `SConstruct` and `godot-cpp` are Python-based; also used to install Conan. | `python --version` | Win: `winget install Python.Python.3` · macOS: `brew install python` · Linux: `sudo apt install python3 python3-pip` |
+| pip | `SConstruct` installs Conan via `pip install --user "conan>=2.0"` if it is missing. | `python -m pip --version` | Ships with Python 3 (otherwise `python -m ensurepip --upgrade`) |
+| SCons | The build system used to build the extension. | `scons --version` | `pip install scons` (all platforms) |
+| CMake | Conan builds OpenCV from source, which is CMake-based. | `cmake --version` | Win: `winget install Kitware.CMake` · macOS: `brew install cmake` · Linux: `sudo apt install cmake` |
+| A C++ compiler | Compiles both the extension and OpenCV (see per-platform below). | per-platform | See the per-platform sections below |
+| Internet access + disk space | Conan downloads recipes and OpenCV sources; the first build compiles OpenCV (~10–20 min). | — | — |
+
+Conan itself does not need to be pre-installed — `scons` bootstraps it and runs `conan profile detect` to create the default profile. You may still install it manually with `pip install "conan>=2.0"`.
+
+Initialize the submodule before the first build:
+
+```bash
+git submodule update --init
+```
+
+Without it, `SConstruct` aborts with a "godot-cpp is not available" error.
+
+### Windows (native)
+
+- Visual Studio 2022 Build Tools with the **Desktop development with C++** workload. This provides the MSVC compiler (`cl.exe`, Conan `compiler.version=193`). Without it, `conan profile detect` finds no compiler and OpenCV cannot be built.
+- CMake on `PATH`.
+- SCons locates MSVC automatically, so a normal terminal works — a Developer Command Prompt is not required.
+
+The C++ runtime and standard are set automatically to static `/MT` and C++17 to match `godot-cpp`, so nothing needs to be configured by hand.
+
+### Linux (native)
+
+Install a compiler toolchain and build tools, for example on Debian/Ubuntu:
+
+```bash
+sudo apt install -y build-essential python3 python3-pip scons git cmake
+```
+
+### macOS (native)
+
+- Xcode Command Line Tools (`xcode-select --install`) for clang.
+- `python3`, `scons`, `cmake`, and `git`, for example via Homebrew.
+
+The build defaults to the host architecture (arm64 or x86_64) rather than universal, because OpenCV is built for a single architecture.
+
+### Android / iOS / Web (cross-compile)
+
+In addition to the native tools, cross-compilation needs a Conan profile describing the target toolchain, because the host default profile cannot cross-build OpenCV. For Android this is the NDK-based profile passed via `CONAN_HOST_PROFILE` (full setup is documented in the Android tracks below). The Android build aborts if the profile is missing.
+
+### Quick readiness check
+
+```bash
+git --version && python --version && python -m pip --version && scons --version && cmake --version && git submodule status
+```
+
+If every command prints a version and the `git submodule status` line is **not** prefixed with `-` (which means the submodule is uninitialized), a native `scons` build should proceed and pull in Conan/OpenCV on its own. This check cannot confirm the C++ compiler — verify that per-platform as described above.
+
+---
+
 ## Supported build platforms
 
 ### Native desktop platforms
@@ -420,6 +483,8 @@ This WSL NDK is used for compiling the Android `.so`.
 
 ## 5. Track 2 — Build the GDExtension `.so` for Android arm64
 
+This track builds the `.so` in WSL. To build it **natively on Windows** without WSL instead, see section **5b (Alternative — build the Android `.so` natively on Windows)** below, then continue with Track 3.
+
 ### 5.1 Clone the repository
 
 Inside WSL:
@@ -456,6 +521,8 @@ conan --version
 ```
 
 ### 5.3 Create Conan Android arm64 host profile
+
+> **Optional since the repo ships a profile:** [`profiles/android-arm64`](./profiles/android-arm64) is Jinja-templated (the NDK path is derived from `ANDROID_HOME`, which 4.4 already exports) and is used automatically when `CONAN_HOST_PROFILE` is not set. You can skip 5.3 and 5.4 entirely and go straight to 5.5. The manual steps below remain valid if you prefer an explicit local profile.
 
 Create the profile folder:
 
@@ -549,6 +616,101 @@ copy:
 WSL:     ~/<repo>/project/bin/android/libopencv_aruco.android.template_debug.arm64.so
 Windows: <repo>\project\bin\android\libopencv_aruco.android.template_debug.arm64.so
 ```
+
+---
+
+## 5b. Alternative — build the Android `.so` natively on Windows (no WSL)
+
+Tracks 1–2 build the native library in WSL. You can instead cross-compile it **directly on Windows** using the Windows Android NDK and Conan, skipping WSL entirely for the `.so`. The result is the same file at the same path, after which you rejoin the workflow at Track 3.
+
+How much setup this needs depends on one thing: **whether your Windows user-profile path contains a space** (for example `C:\Users\Jane Doe\…`). By default both the Android SDK and the Conan cache live under that path, and two build tools choke on spaces (details in 5b.4). Check with:
+
+```powershell
+$env:USERPROFILE    # contains a space -> follow case B (5b.4), otherwise case A (5b.3)
+```
+
+(The location of the repository checkout itself does not matter — a space there is harmless, because the build only passes relative paths for project files.)
+
+### 5b.1 Prerequisites
+
+- The native Windows tools from [Windows (native)](#windows-native) under Prerequisites: Python 3, SCons, CMake, and Visual Studio 2022 Build Tools.
+- Android SDK with NDK **`23.2.8568313`** installed — via Android Studio's SDK Manager (see 6.2) or:
+
+  ```powershell
+  sdkmanager "ndk;23.2.8568313"
+  ```
+
+  This is the same NDK version used in WSL and the version `godot-cpp` expects.
+
+### 5b.2 The Conan Android host profile (checked into the repo)
+
+The repository ships the profile at [`profiles/android-arm64`](./profiles/android-arm64), and the `SConstruct` uses it automatically when `CONAN_HOST_PROFILE` is not set — no manual profile setup is needed.
+
+The file is a Jinja template (Conan renders profiles through Jinja before parsing), which keeps it machine-independent:
+
+- The NDK path is derived at build time from **`ANDROID_HOME`** (fallback: `ANDROID_NDK_ROOT`) instead of being hardcoded, so the same file works on any machine — including the WSL/Linux track, replacing steps 5.3–5.4 there.
+- The Windows-only workarounds are wrapped in `{% if platform.system() == "Windows" %}`:
+  - **`generator=Ninja` + `[tool_requires] ninja/[>=1.11]`** — on a non-MSVC host compiler, Conan otherwise selects the "MinGW Makefiles" CMake generator, which needs a `mingw32-make` that is not installed. Forcing Ninja (and letting Conan supply the binary) fixes this. Linux/WSL renders a plain profile without these lines.
+
+`compiler.version=12` corresponds to the clang shipped in NDK `23.2.8568313` (the version pinned by `godot-cpp`).
+
+To use a different profile instead, set `CONAN_HOST_PROFILE` to a profile name (looked up in `$CONAN_HOME/profiles/`) or a file path — it overrides the repo default.
+
+### 5b.3 Case A — no space in the user path
+
+No path workarounds are needed. Point `ANDROID_HOME` at the real SDK and build from the repository root:
+
+```powershell
+$env:ANDROID_HOME = "C:\Users\<WindowsUser>\AppData\Local\Android\Sdk"
+scons platform=android arch=arm64 target=template_debug
+```
+
+Optional: setting `CONAN_HOME` to a short path (for example `C:\c`) is cheap insurance against the Windows 260-character path limit — OpenCV's source tree nests deeply inside the Conan cache — but it is not required.
+
+### 5b.4 Case B — space in the user path (e.g. `C:\Users\Jane Doe`)
+
+A space in the SDK / Conan-cache path breaks the build in two places:
+
+- Several OpenCV dependencies (for example `libjpeg`) build with **Autotools**, whose `configure` rejects any source path containing a space (`configure: error: unsafe srcdir value`).
+- Archiving `libgodot-cpp...a` fails with *"The filename or extension is too long"*: ~800 object files exceed Windows' 32,767-character command-line limit, and godot-cpp's chunking workaround (`tools/my_spawn.py`) only activates when the archiver command ends in `ar` — a path with a space gets quoted, so it ends in `"` instead.
+
+Both are fixed by giving the SDK and the Conan cache space-free paths. **Both steps below are required** — they fix two different paths: the junction de-spaces the SDK/NDK path (archive failure), `CONAN_HOME` de-spaces the Conan cache (Autotools failure). Skipping either one reintroduces its failure; unlike in case A, `CONAN_HOME` is not optional here.
+
+**Step 1 — expose the SDK under a space-free path.** Create a directory junction (no admin rights required):
+
+```powershell
+New-Item -ItemType Junction -Path C:\asdk -Target "C:\Users\<WindowsUser>\AppData\Local\Android\Sdk"
+```
+
+Verify the NDK is reachable through it:
+
+```powershell
+Test-Path C:\asdk\ndk\23.2.8568313\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe
+```
+
+**Step 2 — build with a space-free Conan cache**, from the repository root:
+
+```powershell
+$env:CONAN_HOME = "C:\c"          # space-free Conan cache (also avoids the 260-char path limit)
+$env:ANDROID_HOME = "C:\asdk"     # space-free SDK via the junction
+scons platform=android arch=arm64 target=template_debug
+```
+
+Stick to one `ANDROID_HOME` value between builds — switching between the junction and the real path changes the compiler path, which invalidates every compiled object and forces a full godot-cpp rebuild.
+
+### 5b.5 Output (both cases)
+
+The first build compiles OpenCV and all dependencies from source and takes a while; later builds reuse the Conan cache. The output matches the WSL build:
+
+```text
+project/bin/android/libopencv_aruco.android.template_debug.arm64.so
+```
+
+Because it is written directly into the project, the copy step (5.7) is unnecessary — continue with Track 3.
+
+### 5b.6 Why the `lib` prefix matters on Windows
+
+On a Windows host, SCons' `SHLIBPREFIX` defaults to an empty string, so the library would be named `opencv_aruco.android.…so` and Godot would not load it (the `.gdextension` expects the `lib` prefix). The `android` branch of [`SConstruct`](./SConstruct) sets `SHLIBPREFIX="lib"` explicitly to force the correct `libopencv_aruco.android.…so` name. This is a no-op on Linux/macOS hosts (which already default to `lib`), so the same `SConstruct` produces identically-named output everywhere.
 
 ---
 

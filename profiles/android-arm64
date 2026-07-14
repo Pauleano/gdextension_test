@@ -1,0 +1,31 @@
+# Conan-Host-Profil fuer den Android-arm64-Cross-Build (im Repo eingecheckt, damit
+# kein manuell angelegtes Profil noetig ist). Conan rendert Profile durch Jinja:
+# der NDK-Pfad wird zur Buildzeit aus ANDROID_HOME (Fallback: ANDROID_NDK_ROOT)
+# abgeleitet -- dieselbe Datei funktioniert also auf Windows- und Linux/WSL-Hosts.
+# Die NDK-Version muss zu godot-cpp passen (godot-cpp/tools/android.py, get_ndk_version()).
+{% set sdk = os.getenv("ANDROID_HOME") %}
+{% set ndk = (sdk ~ "/ndk/23.2.8568313") if sdk else os.environ["ANDROID_NDK_ROOT"] %}
+
+[settings]
+os=Android
+os.api_level=24
+arch=armv8
+compiler=clang
+compiler.version=12
+compiler.libcxx=c++_static
+compiler.cppstd=17
+build_type=Release
+
+{% if platform.system() == "Windows" %}
+# Windows-Host: ohne dies waehlt Conan "MinGW Makefiles" als CMake-Generator
+# (braucht ein nicht installiertes mingw32-make); Ninja erzwingen und via
+# tool_requires gleich von Conan mitliefern lassen.
+[tool_requires]
+ninja/[>=1.11]
+{% endif %}
+
+[conf]
+tools.android:ndk_path={{ ndk | replace("\\", "/") }}
+{% if platform.system() == "Windows" %}
+tools.cmake.cmaketoolchain:generator=Ninja
+{% endif %}

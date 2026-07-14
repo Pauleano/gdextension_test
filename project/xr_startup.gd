@@ -15,6 +15,12 @@ func _ready() -> void:
 		# The XR compositor drives frame pacing; disable the desktop v-sync. (dont wait
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		get_viewport().use_xr = true
+
+		OpenXRMetaEnvironmentDepthExtension.start_environment_depth()
+		# optional: keep your own hands from occluding the patches
+		#OpenXRMetaEnvironmentDepthExtension.set_hand_removal_enabled(true)
+
+
 		_enable_passthrough()
 	else:
 		print("OpenXR not initialised - running in flat (non-XR) mode")

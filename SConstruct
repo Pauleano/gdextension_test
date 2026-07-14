@@ -155,14 +155,11 @@ elif env["platform"] == "linux":
 elif env["platform"] == "android":
     conan_out = os.path.join("conan_install", "android.{}.{}".format(env.get("arch") or "host", env["target"]))
     if conan_outdated(env, conan_out):
-        # Cross-Build: braucht ein Conan-Toolchain-Profil (NDK) via CONAN_HOST_PROFILE.
-        host_profile = os.environ.get("CONAN_HOST_PROFILE")
-        if not host_profile:
-            print_error(
-                "Cross-Build fuer 'android' braucht ein Conan-Profil (Android-NDK):\n"
-                "    CONAN_HOST_PROFILE=/pfad/zu/android-profil scons platform=android arch=arm64"
-            )
-            sys.exit(1)
+        # Cross-Build: braucht ein Conan-Toolchain-Profil (NDK). Default ist das im Repo
+        # eingecheckte profiles/android-arm64 (Jinja-Template: NDK-Pfad kommt zur Buildzeit
+        # aus ANDROID_HOME, funktioniert daher auf Windows- wie Linux/WSL-Hosts).
+        # CONAN_HOST_PROFILE ueberschreibt weiterhin (Profilname im Conan-Home oder Pfad).
+        host_profile = os.environ.get("CONAN_HOST_PROFILE") or os.path.join("profiles", "android-arm64")
         subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
                         "--build=missing", "-pr:h", host_profile], check=True)
     merge_conan_deps(env, conan_out)
@@ -172,6 +169,10 @@ elif env["platform"] == "android":
     library = env.SharedLibrary(  # libopencv_aruco.android.<target>[.double].<arch>.so
         "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
+        # Windows-Host: SHLIBPREFIX ist per Default "" -> ohne dieses "lib" hiesse die
+        # Datei opencv_aruco.android...so und wuerde von der .gdextension (die den
+        # lib-Praefix erwartet) nicht gefunden. Linux/macOS-Host setzt "lib" ohnehin.
+        SHLIBPREFIX="lib",
     )
 
 elif env["platform"] == "macos":
