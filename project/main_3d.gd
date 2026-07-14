@@ -15,6 +15,15 @@ var marker_nodes: Dictionary = {}
 # CameraServerExtension class isn't registered.
 var camera_extension
 var cam_texture: CameraTexture
+
+# Android/Quest: frames come from the GodotAndroidCamera plugin (CameraX ImageAnalysis) as raw
+# CPU bytes -- no CameraTexture, no GPU->CPU readback -- plus the SENSOR timestamp (start of
+# exposure) of every frame, so the head pose can be looked up at the true capture time.
+var android_camera: AndroidCamera
+var _android_cam_started := false
+var _cam_clock_offset_ns := 0          # camera clock ns - Godot ticks ns (get_clock_offset_nanos)
+var _frame_info_logged := false
+var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 @onready var xr_origin: XROrigin3D = $XROrigin3D
 @onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
@@ -29,22 +38,21 @@ var _detect_sem: Semaphore
 var _detect_exit := false
 # input slot (main -> worker), guarded by _detect_mutex; only the newest frame is kept (frame drop)
 var _pending_image: Image
-var _pending_cam_xform: Transform3D
+var _pending_capture_usec := 0
 var _has_pending := false
 # output slot (worker -> main), guarded by _detect_mutex
 var _result_markers: Dictionary = {}
-var _result_cam_xform: Transform3D
+var _result_capture_usec := 0
 var _worker_has_result := false
 
 # --- Capture-latency compensation ---
-# The Image get_image() returns is OLDER than "now": sensor -> ISP -> CameraServer texture takes
-# 1-2 camera frames (~30-100ms). Pairing those old pixels with the LIVE head pose bakes an error
-# proportional to head speed, so a fresh detection first "drags" with the head, then settles.
-# We keep a short timestamped head-pose history and pair each frame with the pose from
-# CAMERA_LATENCY_MS ago instead. Tune on device: patch still drags WITH the head -> raise;
-# patch lags behind the real marker during motion -> lower.
-
-const CAMERA_LATENCY_MS := 50.0 #remove this variable and just give camera_position at the time of image
+# A frame's pixels are OLDER than "now" when they reach us (sensor -> ISP -> delivery takes
+# 1-2 camera frames), so pairing them with the LIVE head pose bakes an error proportional to
+# head speed. We keep a short timestamped head-pose history and bake each detection with the
+# head pose from the frame's CAPTURE time instead (see _head_pose_at).
+# On Android the plugin supplies the true sensor timestamp of every frame; CAMERA_LATENCY_MS is
+# only the fallback guess for the desktop CameraServer path, where no timestamp exists.
+const CAMERA_LATENCY_MS := 50.0
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
@@ -93,18 +101,24 @@ func _ready() -> void:
 	_detect_thread = Thread.new()
 	_detect_thread.start(_detection_loop)
 
-	if OS.get_name() == "Android":
-		# Quest: request camera access; the native CameraServer surfaces feeds once granted.
-		OS.request_permission("android.permission.CAMERA")
-		OS.request_permission("horizonos.permission.HEADSET_CAMERA")
-	elif ClassDB.class_exists("CameraServerExtension"):
-		# Desktop (Windows): custom backend that registers the webcam as a feed.
-		camera_extension = ClassDB.instantiate("CameraServerExtension")  # keep reference alive
+	if OS.get_name() == "Android" and Engine.has_singleton("GodotAndroidCamera"):
+		# Quest: the GodotAndroidCamera plugin (CameraX) pushes frames to _on_android_camera_frame
+		# as raw CPU bytes with a sensor timestamp -- no CameraServer, no GPU->CPU readback.
+		_setup_android_camera()
+	else:
+		if OS.get_name() == "Android":
+			# Plugin singleton missing (APK exported without it): fall back to the native
+			# CameraServer; request camera access so it surfaces feeds once granted.
+			OS.request_permission("android.permission.CAMERA")
+			OS.request_permission("horizonos.permission.HEADSET_CAMERA")
+		elif ClassDB.class_exists("CameraServerExtension"):
+			# Desktop (Windows): custom backend that registers the webcam as a feed.
+			camera_extension = ClassDB.instantiate("CameraServerExtension")  # keep reference alive
 
-	# Since Godot 4.5, monitoring_feeds must be true before feeds are enumerated.
-	CameraServer.monitoring_feeds = true
-	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
-	_on_camera_feeds_updated()                          # in case a feed is already present
+		# Since Godot 4.5, monitoring_feeds must be true before feeds are enumerated.
+		CameraServer.monitoring_feeds = true
+		CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
+		_on_camera_feeds_updated()                          # in case a feed is already present
 
 	
 	_connect_tcp()
@@ -149,25 +163,102 @@ func _on_camera_feeds_updated() -> void:
 	cam_preview.texture = cam_texture
 	print("camera feeds: ", feed_count)
 
+# --- GodotAndroidCamera plugin path (Quest) ---
+
+func _setup_android_camera() -> void:
+	android_camera = AndroidCamera.new()
+	add_child(android_camera)
+	android_camera.camera_frame.connect(_on_android_camera_frame)
+	# Start once BOTH permissions (android CAMERA + horizonos HEADSET_CAMERA) are granted; the
+	# result signal fires once per permission, so re-check on every grant.
+	get_tree().on_request_permissions_result.connect(_on_permission_result)
+	if android_camera.request_camera_permissions():
+		_start_android_camera()
+
+func _on_permission_result(_permission: String, granted: bool) -> void:
+	if granted and not _android_cam_started and android_camera.request_camera_permissions():
+		_start_android_camera()
+
+func _start_android_camera() -> void:
+	_android_cam_started = true
+	# Camera timestamps are on SystemClock.elapsedRealtimeNanos(); this offset maps them onto
+	# Time.get_ticks_usec(), the clock the head-pose history is stamped with.
+	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos()
+	# Pick the LEFT passthrough camera ("50"): the hardcoded intrinsics + lens pose in
+	# _detection_loop belong to it. Fall back to any world-facing feed on non-Quest devices.
+	var cam_id := ""
+	var cameras: Dictionary = android_camera.get_available_cameras()
+	for id in cameras:
+		var info: Dictionary = cameras[id]
+		if info.get("source", "") == "passthrough" and info.get("position", "") == "left":
+			cam_id = id
+			break
+	if cam_id == "":
+		for id in cameras:
+			if cameras[id].get("facing", "") == "back":
+				cam_id = id
+				break
+	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id, "'")
+	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
+	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
+	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
+
+# Runs on the main thread (plugin signals are marshalled onto the engine loop). data is the
+# tight-packed Y plane; timestamp_ns is the sensor timestamp (start of exposure) of THIS frame.
+func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: int, height: int) -> void:
+	# Sensor timestamp -> Godot clock. If the result is implausible (camera clock is not the
+	# realtime clock, or the offset went stale across a headset doze), resample the offset once
+	# and fall back to the fixed-latency guess if it still disagrees.
+	var now_usec := Time.get_ticks_usec()
+	var cap_usec := (timestamp_ns - _cam_clock_offset_ns) / 1000
+	if cap_usec > now_usec or now_usec - cap_usec > 500_000:
+		_cam_clock_offset_ns = android_camera.get_clock_offset_nanos()
+		cap_usec = (timestamp_ns - _cam_clock_offset_ns) / 1000
+		if cap_usec > now_usec or now_usec - cap_usec > 500_000:
+			cap_usec = now_usec - int(CAMERA_LATENCY_MS * 1000.0)
+
+	if not _frame_info_logged:
+		_frame_info_logged = true
+		print("AndroidCamera first frame: ", width, "x", height,
+				" sensor->delivery lag=", (now_usec - cap_usec) / 1000.0, "ms")
+
+	var img := Image.create_from_data(width, height, false, Image.FORMAT_L8, data)
+
+	# debug outputs (grayscale): preview overlay + TCP frame streamer
+	if cam_preview.visible:
+		if _preview_texture == null:
+			_preview_texture = ImageTexture.create_from_image(img)
+			cam_preview.texture = _preview_texture
+		else:
+			_preview_texture.update(img)
+	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
+		_send_frame_tcp(img)
+
+	_dispatch_detection(img, cap_usec)
+
 ####################################################################################################
 
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
-	
-	if cam_texture == null:
-		return
+
+	# Head-pose history: one [t_usec, pose] sample per rendered frame, so a finished detection can
+	# be baked with the pose the head actually had at the frame's capture time (see _head_pose_at).
+	var now_usec := Time.get_ticks_usec()
+	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
+	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
+		_xr_cam_pose_history.pop_front()
 
 	# (a) Apply the latest finished detection (main thread -> scene-tree writes are safe here).
-	# markers + cam_xform come from the worker; cam_xform was sampled at the frame's CAPTURE time
-	# (not now), so the world bake matches the frame the markers were detected in -- using the
-	# live head pose here would re-introduce the ~80ms of head motion as swim.
+	# The markers were detected in a frame captured at _result_capture_usec; look up the head pose
+	# from THAT moment -- using the live pose would re-introduce the pipeline latency as swim.
 	_detect_mutex.lock()
 	var have_result := _worker_has_result
 	var markers: Dictionary = _result_markers
-	var cam_xform: Transform3D = _result_cam_xform
+	var capture_usec: int = _result_capture_usec
 	_worker_has_result = false
 	_detect_mutex.unlock()
 	if have_result:
+		var cam_xform := _head_pose_at(capture_usec)
 		for id in markers:
 			if marker_nodes.has(id):
 				# markers[id] is the marker pose in CAMERA space; cam_xform is the head pose at
@@ -175,37 +266,30 @@ func _process(_delta: float) -> void:
 				# between detections without dragging the patch along.
 				marker_nodes[id].global_transform = cam_xform * markers[id]
 
-	# (b) Hand the newest camera frame to the worker. get_image() (the GPU->CPU readback) and the
-	# head-pose snapshot must happen on the main thread; the worker only does the OpenCV work.
-	#var time = Time.get_ticks_usec() 
+	# (b) Desktop-only: pull the newest CameraServer frame via GPU->CPU readback. On Android the
+	# plugin pushes frames through _on_android_camera_frame instead and cam_texture stays null.
+	if cam_texture == null:
+		return
 	var img := cam_texture.get_image()
-	#print("readback= ", (Time.get_ticks_usec() - time) / 1000.0)
 	if img == null:
 		return
 	#print("image format: ",img.get_format()) #format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
-	
-	
-	
+
 	_tcp_send_timer += _delta
 	if _tcp_send_timer >= TCP_SEND_INTERVAL:
 		_tcp_send_timer = 0.0
 		if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
 			_send_frame_tcp(img)
-	
-	
-		
-	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~CAMERA_LATENCY_MS old
-	# (passthrough pipeline), so look that far back in the pose history (see _head_pose_at).
-	var now_usec := Time.get_ticks_usec()
-	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
-	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
-		_xr_cam_pose_history.pop_front()
-	var cap_cam_xform := _head_pose_at(now_usec - int(CAMERA_LATENCY_MS * 1000.0))
 
+	# No sensor timestamp on this path -- approximate the capture time as CAMERA_LATENCY_MS ago.
+	_dispatch_detection(img, now_usec - int(CAMERA_LATENCY_MS * 1000.0))
+
+# Hand a frame + its capture time to the worker; only the newest frame is kept (frame drop).
+func _dispatch_detection(img: Image, capture_usec: int) -> void:
 	_detect_mutex.lock()
 	var was_pending := _has_pending
 	_pending_image = img                                # overwrites any unconsumed frame -> frame drop
-	_pending_cam_xform = cap_cam_xform
+	_pending_capture_usec = capture_usec
 	_has_pending = true
 	_detect_mutex.unlock()
 	if not was_pending:
@@ -220,7 +304,7 @@ func _detection_loop() -> void:
 			return
 		_detect_mutex.lock()
 		var img: Image = _pending_image
-		var cam_xform: Transform3D = _pending_cam_xform
+		var capture_usec: int = _pending_capture_usec
 		_has_pending = false
 		_pending_image = null
 		_detect_mutex.unlock()
@@ -252,28 +336,39 @@ func _detection_loop() -> void:
 		# Combine the lens rotation + translation into one rigid pose (matches the C++ lens_pose param).
 		var lens_pose := Transform3D(Basis(lens_rotation), lens_translation)
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size, image_downscale_factor, intrinsics, distortion, lens_pose)
-		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
+		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)), " frame_age=", (t0 - capture_usec) / 1000.0, "ms")
 		_detect_mutex.lock()
 		_result_markers = markers
-		_result_cam_xform = cam_xform
+		_result_capture_usec = capture_usec
 		_worker_has_result = true
 		_detect_mutex.unlock()
 
 
-# Newest recorded head pose that is not newer than t_usec (nearest-older sample; at 72fps the
-# history has ~14ms granularity). Falls back to the oldest entry (or the live pose) while the
-# history is still filling up.
+# Head pose at t_usec, interpolated between the two nearest history samples (the raw history has
+# one sample per rendered frame, ~14ms at 72fps; interpolating removes that quantisation).
+# Falls back to the oldest/newest sample (or the live pose) at the edges of the history.
 func _head_pose_at(t_usec: int) -> Transform3D:
-	for i in range(_xr_cam_pose_history.size() - 1, -1, -1):
-		if _xr_cam_pose_history[i][0] <= t_usec:
-			return _xr_cam_pose_history[i][1]
 	if _xr_cam_pose_history.is_empty():
 		return xr_camera.global_transform
+	if t_usec <= _xr_cam_pose_history[0][0]:
+		return _xr_cam_pose_history[0][1]
+	for i in range(_xr_cam_pose_history.size() - 1, -1, -1):
+		if _xr_cam_pose_history[i][0] <= t_usec:
+			if i == _xr_cam_pose_history.size() - 1:
+				return _xr_cam_pose_history[i][1]
+			var t0: int = _xr_cam_pose_history[i][0]
+			var t1: int = _xr_cam_pose_history[i + 1][0]
+			var w := clampf(float(t_usec - t0) / float(t1 - t0), 0.0, 1.0)
+			var p0: Transform3D = _xr_cam_pose_history[i][1]
+			var p1: Transform3D = _xr_cam_pose_history[i + 1][1]
+			return p0.interpolate_with(p1, w)
 	return _xr_cam_pose_history[0][1]
 
 
 
 func _exit_tree() -> void:
+	if android_camera != null and _android_cam_started:
+		android_camera.stop_camera()
 	# Wake the worker out of its wait() and join it, so the thread doesn't outlive the scene.
 	if _detect_thread != null and _detect_thread.is_started():
 		_detect_mutex.lock()

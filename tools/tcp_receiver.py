@@ -62,7 +62,7 @@ while True:
 
     arr = np.frombuffer(data, dtype=np.uint8)
 
-    if fmt == 2:
+    if fmt in (0, 2):   # FORMAT_L8 (Android plugin Y-plane) / FORMAT_R8: 1-channel grayscale
         img = arr.reshape((height, width))
     elif fmt == 5:
         rgba = arr.reshape((height, width, 4))
