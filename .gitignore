@@ -108,3 +108,6 @@ deactivate_conan*
 conaninfo.txt
 conan.lock
 graph_info.json
+
+# Godot hot-reload backup copies of loaded GDExtension DLLs (Windows)
+~*.dll
