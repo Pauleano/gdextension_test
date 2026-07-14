@@ -26,6 +26,8 @@ var _cam_ts_realtime := false          # feed stamps on boottime ("realtime") vs
 var _cam_frame_count := 0
 var _cam_fallback_count := 0           # frames whose timestamp failed the plausibility guard
 var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
+var _xr_api: OpenXRAPIExtension        # access to xrWaitFrame's predicted display time (XrTime)
+var _lead_print_timer := 0.0
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 @onready var xr_origin: XROrigin3D = $XROrigin3D
 @onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
@@ -63,7 +65,7 @@ const CAMERA_LATENCY_MS := 50.0
 # base of an "unknown" timestamp_source is only typically monotonic. Tune on device like
 # CAMERA_LATENCY_MS before: patch drags WITH the head during motion -> raise; patch lags
 # BEHIND the real marker -> lower (may go negative).
-const POSE_LOOKUP_BIAS_MS := 0.0
+const POSE_LOOKUP_BIAS_MS := 35.0
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
@@ -261,7 +263,6 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 	_dispatch_detection(img, cap_usec)
 
 ####################################################################################################
-
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
 
@@ -271,6 +272,22 @@ func _process(_delta: float) -> void:
 	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
 	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
 		_xr_cam_pose_history.pop_front()
+
+	# Measure the OpenXR pose-prediction lead: xrWaitFrame's predicted display time (XrTime =
+	# CLOCK_MONOTONIC ns on the Quest) minus "now" on that same clock (the camera clock offset
+	# maps Godot ticks -> monotonic ns). This is how far in the FUTURE the pose stored above
+	# actually is -- the measured value to use for POSE_LOOKUP_BIAS_MS instead of guessing.
+	# Only on the Android plugin path with a monotonic offset; skipped entirely on desktop.
+	if _android_cam_started and not _cam_ts_realtime:
+		_lead_print_timer += _delta
+		if _lead_print_timer >= 1.0:
+			_lead_print_timer = 0.0
+			if _xr_api == null:
+				_xr_api = OpenXRAPIExtension.new()
+			var pdt := _xr_api.get_predicted_display_time()
+			if pdt != 0:
+				var lead_ms := float(pdt - (now_usec * 1000 + _cam_clock_offset_ns)) / 1.0e6
+				print("OpenXR pose-prediction lead_ms=", lead_ms)
 
 	# (a) Apply the latest finished detection (main thread -> scene-tree writes are safe here).
 	# The markers were detected in a frame captured at _result_capture_usec; look up the head pose
