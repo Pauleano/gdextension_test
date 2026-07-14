@@ -248,7 +248,6 @@ func _detection_loop() -> void:
 		var intrinsics := Vector4(fx, fy, cx, cy)
 		# OpenCV distCoeffs (k1, k2, p1, p2, k3) for the Quest passthrough lens; pass an empty
 		# PackedFloat64Array() for no distortion. These used to be hardcoded in the C++ side.
-		[]
 		var distortion := PackedFloat64Array([-0.00484306,  0.14036606,  0.00044449, -0.00108918, -0.29608385])
 		# Combine the lens rotation + translation into one rigid pose (matches the C++ lens_pose param).
 		var lens_pose := Transform3D(Basis(lens_rotation), lens_translation)
