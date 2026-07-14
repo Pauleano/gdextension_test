@@ -217,25 +217,6 @@ func _start_android_camera() -> void:
 			else android_camera.get_monotonic_clock_offset_nanos()
 	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id,
 			"' (timestamp clock: ", "realtime" if _cam_ts_realtime else "monotonic", ")")
-
-	# Factory calibration of the chosen feed, printed for comparison with the hardcoded values
-	# in _detection_loop. The raw intrinsics are in ACTIVE-ARRAY pixels -> scale to the streamed
-	# 640x480; distortion comes in Android's order [k1,k2,k3,p1,p2] -> print reordered to
-	# OpenCV's distCoeffs order [k1,k2,p1,p2,k3].
-	var cal: Dictionary = android_camera.get_camera_intrinsics(cam_id)
-	print("AndroidCamera calibration (raw): ", cal)
-	if cal.has("intrinsics") and cal.has("active_array_width") and cal.has("active_array_height"):
-		var k: PackedFloat32Array = cal["intrinsics"]
-		var sx := 640.0 / float(cal["active_array_width"])
-		var sy := 480.0 / float(cal["active_array_height"])
-		print("AndroidCamera intrinsics @640x480: fx=", k[0] * sx, " fy=", k[1] * sy,
-				" cx=", k[2] * sx, " cy=", k[3] * sy,
-				(" (ESTIMATED, no factory calibration)" if cal.get("estimated", false) else ""))
-	var d: PackedFloat32Array = cal.get("distortion", PackedFloat32Array())
-	if d.size() >= 5:
-		print("AndroidCamera distortion (OpenCV order k1,k2,p1,p2,k3): ",
-				[d[0], d[1], d[3], d[4], d[2]])
-
 	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
 	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
 	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
