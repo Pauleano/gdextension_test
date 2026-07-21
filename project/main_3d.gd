@@ -7,7 +7,7 @@ var marker_nodes: Dictionary = {}
 # solvePnP marker size (sets the pose's metric scale) AND as the rendered cuboid's side length
 # (see _ready), so the two can never disagree.
 @export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_size := 0.1
-
+@export  var lens_q_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
 
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
 # CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
@@ -241,7 +241,7 @@ func _detection_loop() -> void:
 		# to cancel the flip and keep ONLY the physical mounting tilt.
 		# The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
 		# camera axes -> use raw values, no sign flips.
-		var lens_q_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
+		
 		var lens_rotation := (lens_q_raw * Quaternion(1, 0, 0, 0)).inverse() # if visibly worse, try appending .inverse()
 		var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378) # raw LENS_POSE_TRANSLATION
 
