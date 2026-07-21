@@ -69,6 +69,19 @@ const POSE_LOOKUP_BIAS_MS := 35.0
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
+# --- Debug: step-by-step flow tracing (learning aid, costs performance) ---
+# Every DEBUG_FLOW_EVERY-th camera frame is "traced": each station of the pipeline prints one
+# line tagged with that frame's id, so ONE frame can be followed end to end:
+#   (1) arrival -> (2) timestamp -> (3) bias -> (4) handoff -> (5) worker -> (6) detection
+#   -> (7) pose lookup -> (8) what the timing correction was worth -> (9) world bake
+# Tracing by id (instead of printing everything) keeps the lines of one frame together even
+# though stations run on two threads and ~200ms apart. Set DEBUG_FLOW = false to silence.
+const DEBUG_FLOW := true
+const DEBUG_FLOW_EVERY := 30       # 1 = every frame (very chatty); 30 = ~1 traced frame per second
+var _flow_frame_counter := 0       # frame ids for the desktop path (Android uses _cam_frame_count)
+var _pending_frame_id := 0         # id travelling with the frame in the input slot
+var _result_frame_id := 0          # id travelling with the result in the output slot
+
 
 #stream image of quest to laptop via tcp
 const TCP_HOST := "127.0.0.1"
@@ -219,6 +232,11 @@ func _start_android_camera() -> void:
 			else android_camera.get_monotonic_clock_offset_nanos()
 	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id,
 			"' (timestamp clock: ", "realtime" if _cam_ts_realtime else "monotonic", ")")
+	if DEBUG_FLOW:
+		print("[flow setup] clock bridge calibrated: camera clock is ",
+				"%.3f" % (_cam_clock_offset_ns / 1.0e9), "s AHEAD of Godot's Time.get_ticks_usec().",
+				"  Every frame's exposure time is converted with: cap_usec = (timestamp_ns - ",
+				_cam_clock_offset_ns, ") / 1000")
 	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
 	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
 	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
@@ -231,17 +249,37 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 	# the fixed-latency guess if it still disagrees.
 	var now_usec := Time.get_ticks_usec()
 	var cap_usec := (timestamp_ns - _cam_clock_offset_ns) / 1000
+	var used_fallback := false
 	if cap_usec > now_usec or now_usec - cap_usec > 500_000:
 		_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
 				else android_camera.get_monotonic_clock_offset_nanos()
 		cap_usec = (timestamp_ns - _cam_clock_offset_ns) / 1000
 		if cap_usec > now_usec or now_usec - cap_usec > 500_000:
 			_cam_fallback_count += 1
+			used_fallback = true
 			cap_usec = now_usec - int(CAMERA_LATENCY_MS * 1000.0)
 	var lag_ms := (now_usec - cap_usec) / 1000.0
-	cap_usec -= int(POSE_LOOKUP_BIAS_MS * 1000.0)
 
 	_cam_frame_count += 1
+	var frame_id := _cam_frame_count
+	var traced := _tracing(frame_id)
+	if traced:
+		# (1) what the camera handed us, (2) where that lands on Godot's clock.
+		print("\n[flow #", frame_id, "] (1) FRAME ARRIVES: ", width, "x", height,
+				", ", data.size(), " bytes (grayscale Y-plane, 1 byte/pixel)",
+				", sensor timestamp_ns=", timestamp_ns)
+		print("[flow #", frame_id, "] (2) EXPOSURE TIME on Godot clock: cap_usec=", cap_usec,
+				" -> these pixels are ", "%.1f" % lag_ms, "ms old",
+				"  [", "FALLBACK GUESS, timestamp rejected!" if used_fallback else "from the real sensor timestamp", "]")
+
+	cap_usec -= int(POSE_LOOKUP_BIAS_MS * 1000.0)
+	if traced:
+		# (3) the stored head poses are predicted ~POSE_LOOKUP_BIAS_MS into the future, so the
+		# lookup target is shifted back by the same amount to line the two timelines up.
+		print("[flow #", frame_id, "] (3) POSE LOOKUP TARGET = exposure - POSE_LOOKUP_BIAS_MS(",
+				POSE_LOOKUP_BIAS_MS, "ms) = ", cap_usec,
+				"   (compensates OpenXR predicting head poses ahead of time)")
+
 	if _cam_frame_count == 1 or _cam_frame_count % 300 == 0:
 		print("AndroidCamera frame ", _cam_frame_count, ": ", width, "x", height,
 				" sensor->delivery lag=", lag_ms, "ms",
@@ -260,9 +298,14 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
 		_send_frame_tcp(img)
 
-	_dispatch_detection(img, cap_usec)
+	_dispatch_detection(img, cap_usec, frame_id)
 
 ####################################################################################################
+
+# True if this frame's journey should be traced. The SAME id gives the SAME answer at every
+# station, so all prints belonging to one frame appear together (see DEBUG_FLOW).
+func _tracing(frame_id: int) -> bool:
+	return DEBUG_FLOW and frame_id % DEBUG_FLOW_EVERY == 0
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
 
@@ -296,16 +339,36 @@ func _process(_delta: float) -> void:
 	var have_result := _worker_has_result
 	var markers: Dictionary = _result_markers
 	var capture_usec: int = _result_capture_usec
+	var result_id: int = _result_frame_id
 	_worker_has_result = false
 	_detect_mutex.unlock()
 	if have_result:
 		var cam_xform := _head_pose_at(capture_usec)
+		if _tracing(result_id):
+			# (7) what the history is asked, (8) what the whole correction was worth: the head
+			# pose used vs. the LIVE one -- that difference is exactly the swim we avoid.
+			var live_xform := xr_camera.global_transform
+			var drift_cm := live_xform.origin.distance_to(cam_xform.origin) * 100.0
+			var turn_deg := rad_to_deg(cam_xform.basis.get_rotation_quaternion().angle_to(
+					live_xform.basis.get_rotation_quaternion()))
+			print("[flow #", result_id, "] (7) APPLYING RESULT: asking the pose history for the head pose at ",
+					capture_usec, " (history holds ", _xr_cam_pose_history.size(), " samples, newest is ",
+					"%.1f" % ((now_usec - int(_xr_cam_pose_history[-1][0])) / 1000.0), "ms old)")
+			print("[flow #", result_id, "] (8) HEAD POSE AT CAPTURE pos=", cam_xform.origin,
+					"  vs LIVE pose now=", live_xform.origin,
+					" -> the head moved ", "%.1f" % drift_cm, "cm / turned ", "%.1f" % turn_deg,
+					" deg since exposure. Using the LIVE pose instead would displace the patch by exactly that much (= the swim).")
 		for id in markers:
 			if marker_nodes.has(id):
 				# markers[id] is the marker pose in CAMERA space; cam_xform is the head pose at
 				# capture time. Bake to world space and freeze it there, so the head can move
 				# between detections without dragging the patch along.
 				marker_nodes[id].global_transform = cam_xform * markers[id]
+				if _tracing(result_id):
+					print("[flow #", result_id, "] (9) BAKED marker ", id,
+							": camera-space pos=", markers[id].origin,
+							"  ->  world pos=", marker_nodes[id].global_transform.origin,
+							"  (frozen there until the next detection)")
 
 	# (b) Desktop-only: pull the newest CameraServer frame via GPU->CPU readback. On Android the
 	# plugin pushes frames through _on_android_camera_frame instead and cam_texture stays null.
@@ -323,18 +386,28 @@ func _process(_delta: float) -> void:
 			_send_frame_tcp(img)
 
 	# No sensor timestamp on this path -- approximate the capture time as CAMERA_LATENCY_MS ago.
-	_dispatch_detection(img, now_usec - int(CAMERA_LATENCY_MS * 1000.0))
+	_flow_frame_counter += 1
+	if _tracing(_flow_frame_counter):
+		print("\n[flow #", _flow_frame_counter, "] (1-3) DESKTOP PATH: frame read back from the GPU; no",
+				" sensor timestamp exists here, so the capture time is GUESSED as now - CAMERA_LATENCY_MS(",
+				CAMERA_LATENCY_MS, "ms)")
+	_dispatch_detection(img, now_usec - int(CAMERA_LATENCY_MS * 1000.0), _flow_frame_counter)
 
 # Hand a frame + its capture time to the worker; only the newest frame is kept (frame drop).
-func _dispatch_detection(img: Image, capture_usec: int) -> void:
+func _dispatch_detection(img: Image, capture_usec: int, frame_id: int) -> void:
 	_detect_mutex.lock()
 	var was_pending := _has_pending
+	var dropped_id := _pending_frame_id
 	_pending_image = img                                # overwrites any unconsumed frame -> frame drop
 	_pending_capture_usec = capture_usec
+	_pending_frame_id = frame_id
 	_has_pending = true
 	_detect_mutex.unlock()
 	if not was_pending:
 		_detect_sem.post()                                 # only wake once per pending frame (bounded sem)
+	if _tracing(frame_id):
+		print("[flow #", frame_id, "] (4) HANDED TO WORKER together with its capture time",
+				("  [note: frame #%d was still waiting and got DROPPED -- newest frame wins]" % dropped_id) if was_pending else "  [slot was free, worker woken]")
 
 # Worker thread: blocks on the semaphore, runs OpenCV detection off the main thread, and parks the
 # result for _process to apply. Touches only `processor` and value types -- never the scene tree.
@@ -346,6 +419,7 @@ func _detection_loop() -> void:
 		_detect_mutex.lock()
 		var img: Image = _pending_image
 		var capture_usec: int = _pending_capture_usec
+		var frame_id: int = _pending_frame_id
 		_has_pending = false
 		_pending_image = null
 		_detect_mutex.unlock()
@@ -353,6 +427,10 @@ func _detection_loop() -> void:
 			continue
 		# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
 		var t0 := Time.get_ticks_usec()
+		var traced := _tracing(frame_id)
+		if traced:
+			print("[flow #", frame_id, "] (5) WORKER PICKED IT UP (background thread), frame is now ",
+					"%.1f" % ((t0 - capture_usec) / 1000.0), "ms old. Starting OpenCV detection...")
 		var image_downscale_factor=1 #1 is original image, 0.5 means half width and half height
 		var fx=435.37335635*image_downscale_factor
 		var fy=435.96983202*image_downscale_factor
@@ -378,9 +456,16 @@ func _detection_loop() -> void:
 		var lens_pose := Transform3D(Basis(lens_rotation), lens_translation)
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size, image_downscale_factor, intrinsics, distortion, lens_pose)
 		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)), " frame_age=", (t0 - capture_usec) / 1000.0, "ms")
+		if traced:
+			# The marker poses are relative to the CAMERA AT EXPOSURE TIME -- however long the
+			# detection took, that fact does not age, which is why capture_usec travels along.
+			print("[flow #", frame_id, "] (6) DETECTION DONE in ",
+					"%.1f" % ((Time.get_ticks_usec() - t0) / 1000.0), "ms, found ", markers.size(),
+					" marker(s) in CAMERA space. Parking result + its capture time for the main thread.")
 		_detect_mutex.lock()
 		_result_markers = markers
 		_result_capture_usec = capture_usec
+		_result_frame_id = frame_id
 		_worker_has_result = true
 		_detect_mutex.unlock()
 
