@@ -65,6 +65,10 @@ compile_commands.json
 *.idb
 *.exp
 
+# Godot hot-reload backup copies of loaded GDExtension DLLs (Windows)
+~*.dll
+
+
 # Other stuff
 *.log
 *.lock
