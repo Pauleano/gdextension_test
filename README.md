@@ -492,8 +492,8 @@ Inside WSL:
 ```bash
 mkdir -p ~/dev
 cd ~/dev
-git clone --recurse-submodules https://github.com/Pauleano/gdextension_test.git
-cd gdextension_test
+git clone --recurse-submodules https://github.com/NaReT-Nachbarsprache-wird-reanimiert/godot-opencv-aruco
+cd godot-opencv-aruco
 ```
 
 If the repository was cloned without submodules:
