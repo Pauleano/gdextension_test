@@ -300,7 +300,7 @@ The Godot editor does **not** build the GDExtension `.so` for Android automatica
 | Android SDK platform | `platforms;android-34` |
 | Android build-tools | `build-tools;34.0.0` |
 | Android NDK | `ndk;23.2.8568313` |
-| Godot | Godot 4.6 |
+| Godot | Godot 4.7.1 |
 | OpenXR Vendors plugin | v5 was installed from AssetLib |
 | Android Studio | Android Studio "Quail 1" was installed on Windows |
 
