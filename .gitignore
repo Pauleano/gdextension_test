@@ -67,6 +67,7 @@ compile_commands.json
 
 # Godot hot-reload backup copies of loaded GDExtension DLLs (Windows)
 ~*.dll
+~*.TMP
 
 
 # Other stuff
