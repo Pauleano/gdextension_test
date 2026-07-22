@@ -35,12 +35,20 @@ private:
     bool intrinsics_ready = false;
     void init_quest_intrinsics();
 
+    //gate for all debug output (ACV_DBG in the .cpp); errors (ACV_ERR) ignore it.
+    //static on purpose: the ctor already prints, so GDScript must be able to set this
+    //BEFORE OpenCVProcessor.new() -- an instance property would be set too late.
+    static bool debug_prints_enabled;
+
 protected:
     static void _bind_methods();
 
 public:
     OpenCVProcessor();
     ~OpenCVProcessor();
+
+    //call from GDScript as OpenCVProcessor.set_debug_prints_enabled(true) before new()
+    static void set_debug_prints_enabled(bool p_enabled);
 
     //function die wir in godot aufrufen wollen
     Dictionary get_6dof_of_all_aruco_patches_from_picture(const String &file_path);

@@ -14,17 +14,37 @@
 #endif
 using namespace godot;
 
+bool OpenCVProcessor::debug_prints_enabled = false;
+
+//Einheitliches Format fuer alle Ausgaben: "[opencv_aruco] [OpenCVProcessor::funktion] text".
+//Das feste Praefix macht sie in logcat greifbar (adb logcat | grep opencv_aruco), wo sie sonst
+//zwischen Engine- und OpenXR-Ausgaben untergehen. __func__ statt handgeschriebenem Namen, damit
+//die Angabe beim Umbenennen nicht veraltet.
+//ACV_DBG haengt am debug_prints_enabled-Flag (aus GDScript, siehe main_3d.gd); die Argumente werden
+//nur ausgewertet, wenn das Flag gesetzt ist -- wichtig fuer die Ausgaben im Detektions-Pfad.
+//ACV_ERR ist NICHT abschaltbar: echte Fehler sollen auch ohne Debug-Flag im Log stehen.
+#define ACV_DBG(...) \
+    do { if (debug_prints_enabled) UtilityFunctions::print("[opencv_aruco] [OpenCVProcessor::", __func__, "] ", __VA_ARGS__); } while (0)
+#define ACV_ERR(...) \
+    UtilityFunctions::printerr("[opencv_aruco] [OpenCVProcessor::", __func__, "] ", __VA_ARGS__)
+
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
+    //statisch gebunden, damit es vor new() aufrufbar ist (der Konstruktor gibt selbst schon aus)
+    ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("set_debug_prints_enabled", "enabled"), &OpenCVProcessor::set_debug_prints_enabled);
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
 }
 
+void OpenCVProcessor::set_debug_prints_enabled(bool p_enabled) {
+    debug_prints_enabled = p_enabled;
+}
+
 OpenCVProcessor::OpenCVProcessor() {
-    
-    UtilityFunctions::print(String(cv::getBuildInformation().c_str())); // Full build configuration.
+
+    ACV_DBG("opencv build information:\n", String(cv::getBuildInformation().c_str())); // Full build configuration.
 
     cv::aruco::DetectorParameters params;
     
@@ -41,13 +61,13 @@ OpenCVProcessor::~OpenCVProcessor() {}
 
 void OpenCVProcessor::init_quest_intrinsics() {
 
-    UtilityFunctions::print("init_quest_intrinsics CALLED");//debug print statement
+    ACV_DBG("called");
     #ifdef __ANDROID__
     ACameraManager *mgr = ACameraManager_create();
 
     ACameraIdList *idList = nullptr;
     if (ACameraManager_getCameraIdList(mgr, &idList) != ACAMERA_OK) {
-        UtilityFunctions::printerr("CameraIdList failed");
+        ACV_ERR("ACameraManager_getCameraIdList failed");
         return;
     }
 
@@ -65,9 +85,11 @@ void OpenCVProcessor::init_quest_intrinsics() {
         if (ACameraManager_getCameraCharacteristics(mgr, id, &meta) != ACAMERA_OK)
             continue;
 
-        ACameraMetadata_const_entry intr;
-        ACameraMetadata_const_entry dist;
-        ACameraMetadata_const_entry entry;
+        //Wert-Initialisierung: die count/type-Felder von dist werden unten auch dann ausgegeben,
+        //wenn getConstEntry fehlschlaegt -- ohne {} waere das ein Lesen aus uninitialisiertem Speicher.
+        ACameraMetadata_const_entry intr{};
+        ACameraMetadata_const_entry dist{};
+        ACameraMetadata_const_entry entry{};
 
         // -------------------------
         // INTRINSIC MATRIX
@@ -82,11 +104,8 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float fy = intr.data.f[1];
             float cx = intr.data.f[2];
             float cy = intr.data.f[3];
-            UtilityFunctions::print(fx);
-            UtilityFunctions::print(fy);
-            UtilityFunctions::print(cx);
-            UtilityFunctions::print(cy);
-            
+            ACV_DBG("camera ", sid.c_str(), " intrinsics: fx=", fx, " fy=", fy, " cx=", cx, " cy=", cy);
+
             //need to rescale the 1280x1280 camera intrinsics (quest3 resolution) to the 640x480 (resolution used in gdscript)
             
             cv::Mat K = (cv::Mat_<float>(3,3) <<
@@ -101,7 +120,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             if (sid == "51") {
                 K_cam51 = K;
             }
-            UtilityFunctions::print("Quest intrinsics loaded for camera ", sid.c_str());
+            ACV_DBG("quest intrinsics loaded: camera=", sid.c_str());
         }
 
         // -------------------------
@@ -114,19 +133,17 @@ void OpenCVProcessor::init_quest_intrinsics() {
         
         if (test == ACAMERA_OK && dist.count >= 5)
         {
-            UtilityFunctions::print("get_const_entry for distortions worked");
             D = cv::Mat(1, dist.count, CV_32F);
 
             for (int j = 0; j < dist.count; j++){
                 D.at<float>(j) = dist.data.f[j];
 
             }
-            UtilityFunctions::print("Quest distortions loaded for camera ", sid.c_str());
+            ACV_DBG("quest distortions loaded: camera=", sid.c_str());
         }
-        UtilityFunctions::print("count:", dist.count);
-        UtilityFunctions::print("type:", dist.type);
-        UtilityFunctions::print("getConst_entry for distortions:",test); //getConst_entry for distortions:-10004 means couldnt get distortion coefficients
-        
+        //status=-10004 heisst: keine Distortion-Koeffizienten verfuegbar
+        ACV_DBG("distortion entry: status=", test, " count=", dist.count, " type=", dist.type);
+
         if (ACameraMetadata_getConstEntry(
             meta,
             ACAMERA_LENS_POSE_TRANSLATION,
@@ -134,10 +151,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float tx = entry.data.f[0];
             float ty = entry.data.f[1];
             float tz = entry.data.f[2];
-            UtilityFunctions::print("translation (x,y,z):");
-            UtilityFunctions::print(tx);
-            UtilityFunctions::print(ty);
-            UtilityFunctions::print(tz);
+            ACV_DBG("lens_pose_translation: x=", tx, " y=", ty, " z=", tz);
         }
 
         if (ACameraMetadata_getConstEntry(
@@ -148,11 +162,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             float qy = entry.data.f[1];
             float qz = entry.data.f[2];
             float qw = entry.data.f[3];
-            UtilityFunctions::print("rotation quaternion (x,y,z,w): ");
-            UtilityFunctions::print(qx);
-            UtilityFunctions::print(qy);
-            UtilityFunctions::print(qz);
-            UtilityFunctions::print(qw);
+            ACV_DBG("lens_pose_rotation: x=", qx, " y=", qy, " z=", qz, " w=", qw);
         }
 
     if (ACameraMetadata_getConstEntry(
@@ -160,8 +170,7 @@ void OpenCVProcessor::init_quest_intrinsics() {
             ACAMERA_LENS_POSE_REFERENCE,
             &entry) == ACAMERA_OK) {
         int pose_ref = entry.data.i32[0];
-        UtilityFunctions::print("LENS_POSE_REFERENCE: ");
-        UtilityFunctions::print(pose_ref);
+        ACV_DBG("lens_pose_reference=", pose_ref);
     }
 
 
@@ -181,7 +190,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
     std::string path_std = global_path.utf8().get_data();
     cv::Mat image = cv::imread(path_std);
     if (image.empty()) {
-        UtilityFunctions::printerr("Could not load image: ", global_path);
+        ACV_ERR("could not load image: ", global_path);
         return result;
     }
 
@@ -207,7 +216,8 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
     detector.detectMarkers(image, corners, ids);
 
     if (ids.empty()) {
-        UtilityFunctions::printerr("Kein Marker erkannt");
+        //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
+        ACV_DBG("kein Marker erkannt");
         return result;
     }
 
@@ -287,9 +297,8 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     
     float w = static_cast<float>(det_frame.cols);
     float h = static_cast<float>(det_frame.rows);
-    UtilityFunctions::print("pixel-width(godot):",w);
-    UtilityFunctions::print("pixel-height(godot):",h);
-    
+    ACV_DBG("detect frame: width=", w, " height=", h);
+
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         fx, 0, cx,
         0, fy, cy,
@@ -311,10 +320,11 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
     int64_t t_detect = cv::getTickCount();
     detector.detectMarkers(det_frame, corners, ids);
     double detect_ms = (cv::getTickCount() - t_detect) / tick_freq * 1000.0;
-    UtilityFunctions::print("resize=", resize_ms, "ms  detectMarkers=", detect_ms, "ms");
+    ACV_DBG("resize_ms=", resize_ms, " detect_ms=", detect_ms);
 
     if (ids.empty()) {
-        UtilityFunctions::printerr("Kein Marker erkannt");
+        //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
+        ACV_DBG("kein Marker erkannt");
         return result;
     }
 
@@ -350,7 +360,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
         result[ids[i]] = lens_pose * Transform3D(basis, origin);
     }
 
-    UtilityFunctions::print("solvePnP total=", solve_ms, "ms  (", (int)ids.size(), " markers)");
+    ACV_DBG("solvepnp_ms=", solve_ms, " markers=", (int)ids.size());
     return result;
 }
 
@@ -359,7 +369,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
-        UtilityFunctions::printerr("Empty image from CameraFeed");
+        ACV_ERR("empty image from CameraFeed");
         return result;
     }
 
@@ -422,14 +432,14 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const floa
     if (!cap.isOpened()) {
         cap.open(0, cv::CAP_DSHOW);
         if (!cap.isOpened()) {
-            UtilityFunctions::printerr("Could not open webcam");
+            ACV_ERR("could not open webcam");
             return result;
         }
     }
 
     cv::Mat frame;
     if (!cap.read(frame) || frame.empty()) {
-        UtilityFunctions::printerr("Could not read frame from webcam");
+        ACV_ERR("could not read frame from webcam");
         return result;
     }
 
@@ -455,7 +465,8 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const floa
     detector.detectMarkers(frame, corners, ids);
 
     if (ids.empty()) {
-        UtilityFunctions::printerr("Kein Marker erkannt");
+        //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
+        ACV_DBG("kein Marker erkannt");
         return result;
     }
 

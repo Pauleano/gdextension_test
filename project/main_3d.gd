@@ -8,6 +8,15 @@ var marker_nodes: Dictionary = {}
 # (see _ready), so the two can never disagree.
 @export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_size := 0.1
 
+# Single switch for ALL debug output, this script's and the C++ extension's -- _ready pushes it into
+# OpenCVProcessor before instantiating it. Off by default: with no tcp_receiver.py listening the TCP
+# reconnect logs alone would print once per second for the whole session, and the per-frame timing
+# below fires at the camera rate. Errors are never gated and print regardless. DEBUG_FLOW is a
+# SUB-switch of this one: flow tracing needs both (see _tracing).
+# Format for every debug line: "[opencv_aruco] [main_3d::function] event: key=value" -- the fixed
+# prefix is what makes them findable in logcat (adb logcat | grep opencv_aruco).
+@export var debug_prints_enabled := false
+
 
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
 # CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
@@ -96,6 +105,9 @@ const TCP_SEND_INTERVAL := 0.01
 #######################################################################################################
 
 func _ready() -> void:
+	# Static setter, deliberately called BEFORE new(): the C++ constructor already prints (OpenCV
+	# build info + the Quest intrinsics dump), so an instance property would be set one step too late.
+	OpenCVProcessor.set_debug_prints_enabled(debug_prints_enabled)
 	processor = OpenCVProcessor.new()
 
 	# detect all available aruco_patch nodes, to later set their position
@@ -157,9 +169,10 @@ func _on_camera_feeds_updated() -> void:
 		return
 
 	# log every available feed so we can see which index is the (passthrough) camera on Quest
-	for i in range(feed_count):
-		var f := CameraServer.get_feed(i)
-		print("camera feed index ", i, " id ", f.get_id(), " name ", f.get_name())
+	if debug_prints_enabled:
+		for i in range(feed_count):
+			var f := CameraServer.get_feed(i)
+			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed: index=%d id=%d name=%s" % [i, f.get_id(), f.get_name()])
 
 	# Quest exposes 3 feeds: "1 | FRONT" plus the passthrough pair "50 | BACK" / "51 | BACK".
 	# The world-facing ("BACK") cameras are the passthrough ones we want; feed 0 (FRONT) is the
@@ -175,8 +188,9 @@ func _on_camera_feeds_updated() -> void:
 
 	# Format MUST be chosen before activating, else "format index -1" and no frames.
 	var formats := feed.get_formats()
-	for j in range(formats.size()):
-		print("feed format ", j, ": ", formats[j])
+	if debug_prints_enabled:
+		for j in range(formats.size()):
+			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] format: index=%d value=%s" % [j, formats[j]])
 	if formats.size() > 2:
 		feed.set_format(2, {})        # feed format:10 1280x1280 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
 	elif formats.size() > 0:
@@ -187,7 +201,8 @@ func _on_camera_feeds_updated() -> void:
 	cam_texture.camera_feed_id = feed.get_id()
 	cam_texture.which_feed = CameraServer.FEED_RGBA_IMAGE
 	cam_preview.texture = cam_texture
-	print("camera feeds: ", feed_count)
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed activated: id=%d name=%s feed_count=%d" % [feed.get_id(), feed.get_name(), feed_count])
 
 # --- GodotAndroidCamera plugin path (Quest) ---
 
@@ -230,13 +245,12 @@ func _start_android_camera() -> void:
 	_cam_ts_realtime = str(cameras.get(cam_id, {}).get("timestamp_source", "unknown")) == "realtime"
 	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
 			else android_camera.get_monotonic_clock_offset_nanos()
-	print("AndroidCamera feeds: ", cameras, " -> starting id '", cam_id,
-			"' (timestamp clock: ", "realtime" if _cam_ts_realtime else "monotonic", ")")
-	if DEBUG_FLOW:
-		print("[flow setup] clock bridge calibrated: camera clock is ",
-				"%.3f" % (_cam_clock_offset_ns / 1.0e9), "s AHEAD of Godot's Time.get_ticks_usec().",
-				"  Every frame's exposure time is converted with: cap_usec = (timestamp_ns - ",
-				_cam_clock_offset_ns, ") / 1000")
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_start_android_camera] starting camera: id=%s clock=%s feeds=%s" % [
+				cam_id, "realtime" if _cam_ts_realtime else "monotonic", cameras])
+		# Every frame's exposure time is converted with: cap_usec = (timestamp_ns - offset_ns) / 1000
+		print("[opencv_aruco] [main_3d::_start_android_camera] flow setup: clock bridge calibrated, camera clock is ahead of Time.get_ticks_usec() by offset_s=%.3f offset_ns=%d" % [
+				_cam_clock_offset_ns / 1.0e9, _cam_clock_offset_ns])
 	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
 	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
 	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
@@ -265,26 +279,22 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 	var traced := _tracing(frame_id)
 	if traced:
 		# (1) what the camera handed us, (2) where that lands on Godot's clock.
-		print("\n[flow #", frame_id, "] (1) FRAME ARRIVES: ", width, "x", height,
-				", ", data.size(), " bytes (grayscale Y-plane, 1 byte/pixel)",
-				", sensor timestamp_ns=", timestamp_ns)
-		print("[flow #", frame_id, "] (2) EXPOSURE TIME on Godot clock: cap_usec=", cap_usec,
-				" -> these pixels are ", "%.1f" % lag_ms, "ms old",
-				"  [", "FALLBACK GUESS, timestamp rejected!" if used_fallback else "from the real sensor timestamp", "]")
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (1) frame arrives: width=%d height=%d bytes=%d timestamp_ns=%d (grayscale Y-plane, 1 byte/pixel)" % [
+				frame_id, width, height, data.size(), timestamp_ns])
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (2) exposure time on godot clock: cap_usec=%d age_ms=%.1f source=%s" % [
+				frame_id, cap_usec, lag_ms, "FALLBACK_GUESS_timestamp_rejected" if used_fallback else "sensor_timestamp"])
 
 	cap_usec -= int(POSE_LOOKUP_BIAS_MS * 1000.0)
 	if traced:
 		# (3) the stored head poses are predicted ~POSE_LOOKUP_BIAS_MS into the future, so the
 		# lookup target is shifted back by the same amount to line the two timelines up.
-		print("[flow #", frame_id, "] (3) POSE LOOKUP TARGET = exposure - POSE_LOOKUP_BIAS_MS(",
-				POSE_LOOKUP_BIAS_MS, "ms) = ", cap_usec,
-				"   (compensates OpenXR predicting head poses ahead of time)")
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (3) pose lookup target: target_usec=%d bias_ms=%.1f (compensates OpenXR predicting head poses ahead of time)" % [
+				frame_id, cap_usec, POSE_LOOKUP_BIAS_MS])
 
-	if _cam_frame_count == 1 or _cam_frame_count % 300 == 0:
-		print("AndroidCamera frame ", _cam_frame_count, ": ", width, "x", height,
-				" sensor->delivery lag=", lag_ms, "ms",
-				" clock=", "realtime" if _cam_ts_realtime else "monotonic",
-				" fallbacks=", _cam_fallback_count)
+	if debug_prints_enabled and (_cam_frame_count == 1 or _cam_frame_count % 300 == 0):
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] frame: count=%d width=%d height=%d lag_ms=%.1f clock=%s fallbacks=%d" % [
+				_cam_frame_count, width, height, lag_ms,
+				"realtime" if _cam_ts_realtime else "monotonic", _cam_fallback_count])
 
 	var img := Image.create_from_data(width, height, false, Image.FORMAT_L8, data)
 
@@ -305,7 +315,7 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 # True if this frame's journey should be traced. The SAME id gives the SAME answer at every
 # station, so all prints belonging to one frame appear together (see DEBUG_FLOW).
 func _tracing(frame_id: int) -> bool:
-	return DEBUG_FLOW and frame_id % DEBUG_FLOW_EVERY == 0
+	return debug_prints_enabled and DEBUG_FLOW and frame_id % DEBUG_FLOW_EVERY == 0
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
 
@@ -321,7 +331,9 @@ func _process(_delta: float) -> void:
 	# maps Godot ticks -> monotonic ns). This is how far in the FUTURE the pose stored above
 	# actually is -- the measured value to use for POSE_LOOKUP_BIAS_MS instead of guessing.
 	# Only on the Android plugin path with a monotonic offset; skipped entirely on desktop.
-	if _android_cam_started and not _cam_ts_realtime:
+	# Purely diagnostic, so it is gated as a whole: with debug off we neither allocate the
+	# OpenXRAPIExtension nor query it.
+	if debug_prints_enabled and _android_cam_started and not _cam_ts_realtime:
 		_lead_print_timer += _delta
 		if _lead_print_timer >= 1.0:
 			_lead_print_timer = 0.0
@@ -330,7 +342,7 @@ func _process(_delta: float) -> void:
 			var pdt := _xr_api.get_predicted_display_time()
 			if pdt != 0:
 				var lead_ms := float(pdt - (now_usec * 1000 + _cam_clock_offset_ns)) / 1.0e6
-				print("OpenXR pose-prediction lead_ms=", lead_ms)
+				print("[opencv_aruco] [main_3d::_process] openxr pose prediction: lead_ms=%.2f" % lead_ms)
 
 	# (a) Apply the latest finished detection (main thread -> scene-tree writes are safe here).
 	# The markers were detected in a frame captured at _result_capture_usec; look up the head pose
@@ -351,13 +363,13 @@ func _process(_delta: float) -> void:
 			var drift_cm := live_xform.origin.distance_to(cam_xform.origin) * 100.0
 			var turn_deg := rad_to_deg(cam_xform.basis.get_rotation_quaternion().angle_to(
 					live_xform.basis.get_rotation_quaternion()))
-			print("[flow #", result_id, "] (7) APPLYING RESULT: asking the pose history for the head pose at ",
-					capture_usec, " (history holds ", _xr_cam_pose_history.size(), " samples, newest is ",
-					"%.1f" % ((now_usec - int(_xr_cam_pose_history[-1][0])) / 1000.0), "ms old)")
-			print("[flow #", result_id, "] (8) HEAD POSE AT CAPTURE pos=", cam_xform.origin,
-					"  vs LIVE pose now=", live_xform.origin,
-					" -> the head moved ", "%.1f" % drift_cm, "cm / turned ", "%.1f" % turn_deg,
-					" deg since exposure. Using the LIVE pose instead would displace the patch by exactly that much (= the swim).")
+			print("[opencv_aruco] [main_3d::_process] flow #%d (7) applying result: lookup_usec=%d history_samples=%d newest_age_ms=%.1f" % [
+					result_id, capture_usec, _xr_cam_pose_history.size(),
+					(now_usec - int(_xr_cam_pose_history[-1][0])) / 1000.0])
+			# drift/turn = what the timing correction was worth: using the LIVE pose instead would
+			# displace the patch by exactly that much (= the swim).
+			print("[opencv_aruco] [main_3d::_process] flow #%d (8) head pose at capture: pos=%v live_pos=%v drift_cm=%.1f turn_deg=%.1f" % [
+					result_id, cam_xform.origin, live_xform.origin, drift_cm, turn_deg])
 		for id in markers:
 			if marker_nodes.has(id):
 				# markers[id] is the marker pose in CAMERA space; cam_xform is the head pose at
@@ -365,10 +377,9 @@ func _process(_delta: float) -> void:
 				# between detections without dragging the patch along.
 				marker_nodes[id].global_transform = cam_xform * markers[id]
 				if _tracing(result_id):
-					print("[flow #", result_id, "] (9) BAKED marker ", id,
-							": camera-space pos=", markers[id].origin,
-							"  ->  world pos=", marker_nodes[id].global_transform.origin,
-							"  (frozen there until the next detection)")
+					# frozen at this world pose until the next detection
+					print("[opencv_aruco] [main_3d::_process] flow #%d (9) baked marker: id=%d camera_pos=%v world_pos=%v" % [
+							result_id, id, markers[id].origin, marker_nodes[id].global_transform.origin])
 
 	# (b) Desktop-only: pull the newest CameraServer frame via GPU->CPU readback. On Android the
 	# plugin pushes frames through _on_android_camera_frame instead and cam_texture stays null.
@@ -377,7 +388,9 @@ func _process(_delta: float) -> void:
 	var img := cam_texture.get_image()
 	if img == null:
 		return
-	#print("image format: ",img.get_format()) #format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
+	# format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_process] readback: image_format=%d" % img.get_format())
 
 	_tcp_send_timer += _delta
 	if _tcp_send_timer >= TCP_SEND_INTERVAL:
@@ -388,9 +401,8 @@ func _process(_delta: float) -> void:
 	# No sensor timestamp on this path -- approximate the capture time as CAMERA_LATENCY_MS ago.
 	_flow_frame_counter += 1
 	if _tracing(_flow_frame_counter):
-		print("\n[flow #", _flow_frame_counter, "] (1-3) DESKTOP PATH: frame read back from the GPU; no",
-				" sensor timestamp exists here, so the capture time is GUESSED as now - CAMERA_LATENCY_MS(",
-				CAMERA_LATENCY_MS, "ms)")
+		print("[opencv_aruco] [main_3d::_process] flow #%d (1-3) desktop path: no sensor timestamp, capture time guessed as now - camera_latency_ms=%.1f" % [
+				_flow_frame_counter, CAMERA_LATENCY_MS])
 	_dispatch_detection(img, now_usec - int(CAMERA_LATENCY_MS * 1000.0), _flow_frame_counter)
 
 # Hand a frame + its capture time to the worker; only the newest frame is kept (frame drop).
@@ -406,8 +418,9 @@ func _dispatch_detection(img: Image, capture_usec: int, frame_id: int) -> void:
 	if not was_pending:
 		_detect_sem.post()                                 # only wake once per pending frame (bounded sem)
 	if _tracing(frame_id):
-		print("[flow #", frame_id, "] (4) HANDED TO WORKER together with its capture time",
-				("  [note: frame #%d was still waiting and got DROPPED -- newest frame wins]" % dropped_id) if was_pending else "  [slot was free, worker woken]")
+		print("[opencv_aruco] [main_3d::_dispatch_detection] flow #%d (4) handed to worker: %s" % [
+				frame_id,
+				("dropped_frame=%d (newest frame wins)" % dropped_id) if was_pending else "slot_was_free=true worker_woken=true"])
 
 # Worker thread: blocks on the semaphore, runs OpenCV detection off the main thread, and parks the
 # result for _process to apply. Touches only `processor` and value types -- never the scene tree.
@@ -429,8 +442,8 @@ func _detection_loop() -> void:
 		var t0 := Time.get_ticks_usec()
 		var traced := _tracing(frame_id)
 		if traced:
-			print("[flow #", frame_id, "] (5) WORKER PICKED IT UP (background thread), frame is now ",
-					"%.1f" % ((t0 - capture_usec) / 1000.0), "ms old. Starting OpenCV detection...")
+			print("[opencv_aruco] [main_3d::_detection_loop] flow #%d (5) worker picked it up: frame_age_ms=%.1f" % [
+					frame_id, (t0 - capture_usec) / 1000.0])
 		var image_downscale_factor=1 #1 is original image, 0.5 means half width and half height
 		var fx=435.37335635*image_downscale_factor
 		var fy=435.96983202*image_downscale_factor
@@ -455,13 +468,18 @@ func _detection_loop() -> void:
 		# Combine the lens rotation + translation into one rigid pose (matches the C++ lens_pose param).
 		var lens_pose := Transform3D(Basis(lens_rotation), lens_translation)
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size, image_downscale_factor, intrinsics, distortion, lens_pose)
-		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)), " frame_age=", (t0 - capture_usec) / 1000.0, "ms")
-		if traced:
-			# The marker poses are relative to the CAMERA AT EXPOSURE TIME -- however long the
-			# detection took, that fact does not age, which is why capture_usec travels along.
-			print("[flow #", frame_id, "] (6) DETECTION DONE in ",
-					"%.1f" % ((Time.get_ticks_usec() - t0) / 1000.0), "ms, found ", markers.size(),
-					" marker(s) in CAMERA space. Parking result + its capture time for the main thread.")
+		# Guarded inline rather than via a helper function: a helper would build this string on every
+		# detection before it could check the flag.
+		if debug_prints_enabled:
+			var detect_ms := (Time.get_ticks_usec() - t0) / 1000.0
+			var tracking_fps := 1000.0 / detect_ms if detect_ms > 0.0 else 0.0
+			print("[opencv_aruco] [main_3d::_detection_loop] detect_ms=%.1f tracking_fps=%.1f render_fps=%d frame_age_ms=%.1f markers=%d" % [
+					detect_ms, tracking_fps, Engine.get_frames_per_second(), (t0 - capture_usec) / 1000.0, markers.size()])
+			if traced:
+				# The marker poses are relative to the CAMERA AT EXPOSURE TIME -- however long the
+				# detection took, that fact does not age, which is why capture_usec travels along.
+				print("[opencv_aruco] [main_3d::_detection_loop] flow #%d (6) detection done: detect_ms=%.1f markers=%d (camera space; parking result + capture time for the main thread)" % [
+						frame_id, detect_ms, markers.size()])
 		_detect_mutex.lock()
 		_result_markers = markers
 		_result_capture_usec = capture_usec
@@ -521,17 +539,15 @@ func _send_frame_tcp(img: Image) -> void:
 
 	var err := stream_peer.put_data(bytes)
 	if err != OK:
-		print("TCP put_data error: ", err)
-	
+		push_error("[opencv_aruco] [main_3d::_send_frame_tcp] put_data failed: err=%d" % err)
+
 func _connect_tcp() -> void:
 	stream_peer = StreamPeerTCP.new()
 	stream_peer.big_endian = true
 
 	var err := stream_peer.connect_to_host(TCP_HOST, TCP_PORT)
-	print("TCP connect_to_host err: ", err)
-
-	if err != OK:
-		print("TCP connect_to_host failed immediately: ", err)
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_connect_tcp] connect_to_host: err=%d" % err)
 
 
 func _poll_tcp(delta: float) -> void:
@@ -544,7 +560,8 @@ func _poll_tcp(delta: float) -> void:
 	var status := stream_peer.get_status()
 
 	if status != _last_tcp_status:
-		print("TCP status changed: ", _last_tcp_status, " -> ", status)
+		if debug_prints_enabled:
+			print("[opencv_aruco] [main_3d::_poll_tcp] status changed: from=%d to=%d" % [_last_tcp_status, status])
 		_last_tcp_status = status
 
 	if status == StreamPeerTCP.STATUS_CONNECTED:
@@ -558,7 +575,8 @@ func _poll_tcp(delta: float) -> void:
 		_tcp_reconnect_timer += delta
 		if _tcp_reconnect_timer >= 1.0:
 			_tcp_reconnect_timer = 0.0
-			print("TCP reconnecting...")
+			if debug_prints_enabled:
+				print("[opencv_aruco] [main_3d::_poll_tcp] reconnecting")
 			_connect_tcp()
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop de.unigreifswald.opencvaruco
