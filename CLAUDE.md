@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Godot 4.6 C++ GDExtension (`opencv_aruco`) that statically links OpenCV (via Conan) to detect ArUco markers and compute their 6DoF poses, plus a Godot test project that renders a mesh on each detected marker. The main deployment target is a Meta Quest 3 (Android arm64, OpenXR passthrough AR); Windows desktop is the development platform.
+A Godot 4.7 C++ GDExtension (`opencv_aruco`) that statically links OpenCV (via Conan) to detect ArUco markers and compute their 6DoF poses, plus a Godot test project that renders a mesh on each detected marker. The main deployment target is a Meta Quest 3 (Android arm64, OpenXR passthrough AR); Windows desktop is the development platform.
 
 ## Build commands
 
