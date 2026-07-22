@@ -56,7 +56,7 @@ var _worker_has_result := false
 # CAMERA_LATENCY_MS ago instead. Tune on device: patch still drags WITH the head -> raise;
 # patch lags behind the real marker during motion -> lower.
 
-const CAMERA_LATENCY_MS := 50.0 #remove this variable and just give camera_position at the time of image
+const CAMERA_LATENCY_MS := 90.0 #estimated correction variable to match head_pose and marker_pose (relative to real_life_camera_pose) in time
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
@@ -121,7 +121,6 @@ func _ready() -> void:
 	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 	_on_camera_feeds_updated()                          # in case a feed is already present
 
-	
 	_connect_tcp()
 	
 func _on_camera_feeds_updated() -> void:
