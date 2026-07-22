@@ -9,6 +9,14 @@ var marker_nodes: Dictionary = {}
 @export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_size := 0.1
 @export  var lens_q_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
 
+# Single switch for ALL debug output, this script's and the C++ extension's -- _ready pushes it into
+# OpenCVProcessor before instantiating it. Off by default: with no tcp_receiver.py listening the TCP
+# reconnect logs alone would print once per second for the whole session, and the detection timing
+# below fires ~12x/s on the Quest. Errors are never gated and print regardless.
+# Format for every debug line: "[opencv_aruco] [main_3d::function] event: key=value" -- the fixed
+# prefix is what makes them findable in logcat (adb logcat | grep opencv_aruco).
+@export var debug_prints_enabled := false
+
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
 # CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
 # instantiate via ClassDB so the script still parses on Android, where the
@@ -31,6 +39,10 @@ var _detect_exit := false
 var _pending_image: Image
 var _pending_cam_xform: Transform3D
 var _has_pending := false
+# true from the moment the worker takes a frame until it parks the result; together with
+# _has_pending this is "the worker cannot use another frame right now", which is what gates
+# the readback in _process (see there).
+var _worker_busy := false
 # output slot (worker -> main), guarded by _detect_mutex
 var _result_markers: Dictionary = {}
 var _result_cam_xform: Transform3D
@@ -62,6 +74,9 @@ const TCP_SEND_INTERVAL := 0.01
 #######################################################################################################
 
 func _ready() -> void:
+	# Static setter, deliberately called BEFORE new(): the C++ constructor already prints (OpenCV
+	# build info + the Quest intrinsics dump), so an instance property would be set one step too late.
+	OpenCVProcessor.set_debug_prints_enabled(debug_prints_enabled)
 	processor = OpenCVProcessor.new()
 
 	# detect all available aruco_patch nodes, to later set their position
@@ -117,9 +132,10 @@ func _on_camera_feeds_updated() -> void:
 		return
 
 	# log every available feed so we can see which index is the (passthrough) camera on Quest
-	for i in range(feed_count):
-		var f := CameraServer.get_feed(i)
-		print("camera feed index ", i, " id ", f.get_id(), " name ", f.get_name())
+	if debug_prints_enabled:
+		for i in range(feed_count):
+			var f := CameraServer.get_feed(i)
+			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed: index=%d id=%d name=%s" % [i, f.get_id(), f.get_name()])
 
 	# Quest exposes 3 feeds: "1 | FRONT" plus the passthrough pair "50 | BACK" / "51 | BACK".
 	# The world-facing ("BACK") cameras are the passthrough ones we want; feed 0 (FRONT) is the
@@ -135,8 +151,9 @@ func _on_camera_feeds_updated() -> void:
 
 	# Format MUST be chosen before activating, else "format index -1" and no frames.
 	var formats := feed.get_formats()
-	for j in range(formats.size()):
-		print("feed format ", j, ": ", formats[j])
+	if debug_prints_enabled:
+		for j in range(formats.size()):
+			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] format: index=%d value=%s" % [j, formats[j]])
 	if formats.size() > 2:
 		feed.set_format(2, {})        # feed format:10 1280x1280 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
 	elif formats.size() > 0:
@@ -147,7 +164,8 @@ func _on_camera_feeds_updated() -> void:
 	cam_texture.camera_feed_id = feed.get_id()
 	cam_texture.which_feed = CameraServer.FEED_RGBA_IMAGE
 	cam_preview.texture = cam_texture
-	print("camera feeds: ", feed_count)
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed activated: id=%d name=%s feed_count=%d" % [feed.get_id(), feed.get_name(), feed_count])
 
 ####################################################################################################
 
@@ -175,17 +193,38 @@ func _process(_delta: float) -> void:
 				# between detections without dragging the patch along.
 				marker_nodes[id].global_transform = cam_xform * markers[id]
 
-	# (b) Hand the newest camera frame to the worker. get_image() (the GPU->CPU readback) and the
-	# head-pose snapshot must happen on the main thread; the worker only does the OpenCV work.
-	#var time = Time.get_ticks_usec() 
+	# (b) Sample the head pose EVERY render frame, independently of whether we read back below:
+	# _head_pose_at interpolates nothing, it picks the nearest-older sample, so its accuracy is the
+	# sampling period. Recording only on detection frames would coarsen the history from ~14ms to
+	# ~80ms and put most of the capture-latency compensation back as error.
+	var now_usec := Time.get_ticks_usec()
+	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
+	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
+		_xr_cam_pose_history.pop_front()
+
+	# (c) Hand the newest camera frame to the worker. get_image() (the GPU->CPU readback) and the
+	# head-pose lookup must happen on the main thread; the worker only does the OpenCV work.
+	#
+	# Readback ONLY when the worker can actually consume the frame. Detection costs ~80ms while
+	# _process runs at the render rate (~72fps on Quest), so an unconditional get_image() paid the
+	# full readback ~6x per detection and threw all but the last one away in the frame-drop slot.
+	# The readback is a GPU->CPU stall on the main thread, i.e. render-frame time we were burning
+	# for nothing. Skipping it while the worker is busy also means the frame we DO read back is the
+	# freshest one at the instant detection starts, which shortens the pose-history lookback.
+	_detect_mutex.lock()
+	var worker_can_take := not _has_pending and not _worker_busy
+	_detect_mutex.unlock()
+	if not worker_can_take:
+		return
+
+	var readback_t0 := Time.get_ticks_usec()
 	var img := cam_texture.get_image()
-	#print("readback= ", (Time.get_ticks_usec() - time) / 1000.0)
 	if img == null:
 		return
-	#print("image format: ",img.get_format()) #format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
-	
-	
-	
+	# format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_process] readback_ms=%.2f image_format=%d" % [(Time.get_ticks_usec() - readback_t0) / 1000.0, img.get_format()])
+
 	_tcp_send_timer += _delta
 	if _tcp_send_timer >= TCP_SEND_INTERVAL:
 		_tcp_send_timer = 0.0
@@ -195,21 +234,15 @@ func _process(_delta: float) -> void:
 	
 		
 	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~CAMERA_LATENCY_MS old
-	# (passthrough pipeline), so look that far back in the pose history (see _head_pose_at).
-	var now_usec := Time.get_ticks_usec()
-	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
-	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
-		_xr_cam_pose_history.pop_front()
+	# (passthrough pipeline), so look that far back in the pose history (filled in (b) above).
 	var cap_cam_xform := _head_pose_at(now_usec - int(CAMERA_LATENCY_MS * 1000.0))
 
 	_detect_mutex.lock()
-	var was_pending := _has_pending
-	_pending_image = img                                # overwrites any unconsumed frame -> frame drop
+	_pending_image = img
 	_pending_cam_xform = cap_cam_xform
-	_has_pending = true
+	_has_pending = true                                 # was false: checked above, and only we set it
 	_detect_mutex.unlock()
-	if not was_pending:
-		_detect_sem.post()                                 # only wake once per pending frame (bounded sem)
+	_detect_sem.post()                                  # exactly one post per pending frame
 
 # Worker thread: blocks on the semaphore, runs OpenCV detection off the main thread, and parks the
 # result for _process to apply. Touches only `processor` and value types -- never the scene tree.
@@ -223,6 +256,7 @@ func _detection_loop() -> void:
 		var cam_xform: Transform3D = _pending_cam_xform
 		_has_pending = false
 		_pending_image = null
+		_worker_busy = img != null      # cleared again once the result is parked, below
 		_detect_mutex.unlock()
 		if img == null:
 			continue
@@ -252,11 +286,17 @@ func _detection_loop() -> void:
 		# Combine the lens rotation + translation into one rigid pose (matches the C++ lens_pose param).
 		var lens_pose := Transform3D(Basis(lens_rotation), lens_translation)
 		var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, aruco_patch_size, image_downscale_factor, intrinsics, distortion, lens_pose)
-		print("(worker thread) detect=", (Time.get_ticks_usec() - t0) / 1000.0, "ms  fps=", Engine.get_frames_per_second(), " FPSOfTracking:=", (1000/((Time.get_ticks_usec() - t0) / 1000.0)) )
+		# Guarded inline rather than via a helper function: a helper would build this string on every
+		# detection (~12x/s on the Quest) before it could check the flag.
+		if debug_prints_enabled:
+			var detect_ms := (Time.get_ticks_usec() - t0) / 1000.0
+			var tracking_fps := 1000.0 / detect_ms if detect_ms > 0.0 else 0.0
+			print("[opencv_aruco] [main_3d::_detection_loop] detect_ms=%.1f tracking_fps=%.1f render_fps=%d markers=%d" % [detect_ms, tracking_fps, Engine.get_frames_per_second(), markers.size()])
 		_detect_mutex.lock()
 		_result_markers = markers
 		_result_cam_xform = cam_xform
 		_worker_has_result = true
+		_worker_busy = false            # _process may read back the next frame from here on
 		_detect_mutex.unlock()
 
 
@@ -300,17 +340,15 @@ func _send_frame_tcp(img: Image) -> void:
 
 	var err := stream_peer.put_data(bytes)
 	if err != OK:
-		print("TCP put_data error: ", err)
-	
+		push_error("[opencv_aruco] [main_3d::_send_frame_tcp] put_data failed: err=%d" % err)
+
 func _connect_tcp() -> void:
 	stream_peer = StreamPeerTCP.new()
 	stream_peer.big_endian = true
 
 	var err := stream_peer.connect_to_host(TCP_HOST, TCP_PORT)
-	print("TCP connect_to_host err: ", err)
-
-	if err != OK:
-		print("TCP connect_to_host failed immediately: ", err)
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_connect_tcp] connect_to_host: err=%d" % err)
 
 
 func _poll_tcp(delta: float) -> void:
@@ -323,7 +361,8 @@ func _poll_tcp(delta: float) -> void:
 	var status := stream_peer.get_status()
 
 	if status != _last_tcp_status:
-		print("TCP status changed: ", _last_tcp_status, " -> ", status)
+		if debug_prints_enabled:
+			print("[opencv_aruco] [main_3d::_poll_tcp] status changed: from=%d to=%d" % [_last_tcp_status, status])
 		_last_tcp_status = status
 
 	if status == StreamPeerTCP.STATUS_CONNECTED:
@@ -337,7 +376,8 @@ func _poll_tcp(delta: float) -> void:
 		_tcp_reconnect_timer += delta
 		if _tcp_reconnect_timer >= 1.0:
 			_tcp_reconnect_timer = 0.0
-			print("TCP reconnecting...")
+			if debug_prints_enabled:
+				print("[opencv_aruco] [main_3d::_poll_tcp] reconnecting")
 			_connect_tcp()
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop de.unigreifswald.opencvaruco
