@@ -112,3 +112,8 @@ graph_info.json
 # Godot hot-reload backup copies of loaded GDExtension DLLs (Windows)
 ~*.dll
 ~*.TMP
+
+# Godot editor scene/resource save temporaries (<file><random>.tmp, written next to the target and
+# renamed over it). Orphaned when a save is interrupted or the rename is blocked.
+*.tscn*.tmp
+*.tres*.tmp
