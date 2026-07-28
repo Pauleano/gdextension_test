@@ -31,7 +31,7 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
+    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_sizes", "default_marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
     //statisch gebunden, damit es vor new() aufrufbar ist (der Konstruktor gibt selbst schon aus)
     ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("set_debug_prints_enabled", "enabled"), &OpenCVProcessor::set_debug_prints_enabled);
 
@@ -253,21 +253,22 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
     return result;
 }
 
-//shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). uses the passed marker_size.
+//shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). marker_sizes is the
+//per-id ground-truth table (id -> side length in m); ids without an entry use default_marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dictionary &marker_sizes, float default_marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose) {
     Dictionary result;
 
-    // Physical passthrough-camera offset from the head-tracked reference (XRCamera3D), taken from
-    // the Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION and passed in from GDScript. solvePnP
-    // returns the marker pose in the physical CAMERA frame, so we pre-multiply by this lens pose to
-    // re-express each marker relative to the head reference; GDScript then bakes it to world space
-    // with the head transform sampled at capture time. Identity rotation + zero translation makes
-    // this a no-op, so the pose is unchanged until real values are supplied.
+    // Rigid pose pre-multiplied onto every marker, supplied by GDScript. solvePnP returns the
+    // marker pose in the physical CAMERA frame; GDScript passes head_pose_at_capture_time *
+    // lens_pose (the Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION offset), so both
+    // transforms that hold for ALL markers are applied in one place and the returned poses are
+    // already WORLD space. An identity Transform3D makes this a no-op and yields raw
+    // camera-space poses instead.
     // NOTE: if markers land in the wrong place, the axis convention between the Android lens pose
     // and Godot is the knob -- try the conjugate quaternion / flipped translation signs (easiest to
-    // do where lens_pose is constructed in GDScript). An identity Transform3D makes this a no-op.
+    // do where the lens pose is constructed in GDScript).
 
     double tick_freq = cv::getTickFrequency();
 
@@ -284,14 +285,6 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
         det_frame = frame;
     }
     double resize_ms = (cv::getTickCount() - t_resize) / tick_freq * 1000.0;
-
-    float half = marker_size / 2.0f;
-    std::vector<cv::Point3f> obj_pts = {
-        {-half,  half, 0.0f},
-        { half,  half, 0.0f},
-        { half, -half, 0.0f},
-        {-half, -half, 0.0f}
-    };
 
     // Intrinsics derived from the (downscaled) detection frame, so corners + K share one pixel space.
     
@@ -330,6 +323,20 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 
     double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
+        // Per-id physical size: table entry from GDScript (double Variant) if present, else the
+        // global fallback. Non-positive values count as "no entry" so a bad table row can never
+        // hand solvePnP a degenerate square. GDScript int keys match ids[i] (int Variant) exactly.
+        double msize = (double)marker_sizes.get(ids[i], default_marker_size);
+        if (!(msize > 0.0)) {
+            msize = default_marker_size;
+        }
+        const float half = (float)msize / 2.0f;
+        const std::vector<cv::Point3f> obj_pts = {
+            {-half,  half, 0.0f},
+            { half,  half, 0.0f},
+            { half, -half, 0.0f},
+            {-half, -half, 0.0f}
+        };
         cv::Mat rvec, tvec;
         int64_t t_solve = cv::getTickCount();
         bool ok2 = cv::solvePnP(
@@ -365,7 +372,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, float mar
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const float &marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const Dictionary &marker_sizes, const float &default_marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -423,7 +430,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         }
     }
 
-    return detect_and_solve_all(gray, marker_size, downscale, fx, fy, cx, cy, distort, lens_pose);
+    return detect_and_solve_all(gray, marker_sizes, default_marker_size, downscale, fx, fy, cx, cy, distort, lens_pose);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {

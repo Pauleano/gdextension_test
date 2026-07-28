@@ -69,6 +69,11 @@ compile_commands.json
 ~*.dll
 ~*.TMP
 
+# Godot editor scene/resource save temporaries (<file><random>.tmp, written next to the target and
+# renamed over it). Orphaned when a save is interrupted or the rename is blocked.
+*.tscn*.tmp
+*.tres*.tmp
+
 
 # Other stuff
 *.log
