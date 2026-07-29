@@ -10,8 +10,9 @@ var marker_nodes: Dictionary = {}
 # id -> Time.get_ticks_usec() of the last detection result that contained it; drives the deletion
 # grace period. Same lifetime as marker_nodes, kept in step with it.
 var _marker_last_seen: Dictionary = {}
-# id -> resolved size in meters for the C++ side; built once in _ready and read-only afterwards
-# (detection tasks read it without a lock -- safe because no task is dispatched before _ready ends).
+# id -> resolved size in meters for the C++ side. Rebuilt by _sync_marker_sizes, which runs in
+# _ready and then once per dispatch in _process -- but ONLY while no detection task is in flight,
+# so the unlocked read in _detect_frame never overlaps a write.
 var _marker_size_table: Dictionary = {}
 
 # Fallback physical side length, in meters, for every marker id WITHOUT a table entry below.
@@ -145,6 +146,38 @@ func _marker_size_for(id: int) -> float:
 	return aruco_patch_size
 
 
+# Re-resolve aruco_patch_sizes/aruco_patch_size into the id -> size table the C++ side gets, and put
+# the same numbers on the live patch meshes. Both consumers of a marker's size are refreshed here,
+# so they can never drift apart.
+# CALLER CONTRACT: main thread, and only while _detect_task_id == -1. _detect_frame reads
+# _marker_size_table from a worker thread without a lock, so this is the one point in the frame at
+# which rewriting it is safe. Cheap enough to run per dispatch (~12x/s): ten dictionary writes plus
+# one scale compare per live patch.
+func _sync_marker_sizes() -> void:
+	for id in aruco_patch_sizes.size():
+		_marker_size_table[id] = _marker_size_for(id)
+	# Rows the inspector shrank the array past must go, else a deleted entry would keep feeding
+	# solvePnP its old size instead of falling back to aruco_patch_size. keys() is a copy, so
+	# erasing inside the loop is safe.
+	for id in _marker_size_table.keys():
+		if id >= aruco_patch_sizes.size():
+			_marker_size_table.erase(id)
+	# Existing patches got their scale once, at creation time (_get_or_create_patch). Without this
+	# a size change would only reach the mesh after the marker had been lost for
+	# PATCH_LOST_TIMEOUT_MS and the node was rebuilt -- the box would keep its old edge length while
+	# the pose already used the new one. Compared approximately because scale components are 32-bit:
+	# an exact != against the double from _marker_size_for would fire every single time.
+	for id in marker_nodes:
+		var size := _marker_size_for(id)
+		# The one child added in _get_or_create_patch; the patch node itself must stay scale-free,
+		# it carries the baked pose.
+		var mesh_instance: MeshInstance3D = marker_nodes[id].get_child(0)
+		if not is_equal_approx(mesh_instance.scale.x, size):
+			mesh_instance.scale = Vector3(size, size, PATCH_THICKNESS)
+			if debug_prints_enabled:
+				print("[opencv_aruco] [main_3d::_sync_marker_sizes] patch resized: id=%d size=%.3f" % [id, size])
+
+
 func _ready() -> void:
 	# The property setter already pushed this into the extension at scene-instantiation time; repeat
 	# it here so the flag is also correct when the scene does NOT override the default (the setter
@@ -160,10 +193,9 @@ func _ready() -> void:
 	# No patch nodes to find: they are created on demand as markers turn up (see
 	# _get_or_create_patch) and freed again when they stop being detected.
 
-	# Resolve the size table once for the C++ side (entries are pre-resolved through
-	# _marker_size_for, so the C++ default only fires for ids >= the table length).
-	for id in aruco_patch_sizes.size():
-		_marker_size_table[id] = _marker_size_for(id)
+	# Resolve the size table for the C++ side (entries are pre-resolved through _marker_size_for, so
+	# the C++ default only fires for ids >= the table length). _process refreshes it from here on.
+	_sync_marker_sizes()
 
 	# No worker setup needed: detection runs as one-shot WorkerThreadPool tasks, dispatched on
 	# demand once frames arrive (see _process) -- long after _ready has finished.
@@ -259,6 +291,11 @@ func _process(_delta: float) -> void:
 	# are pulled here, so declining to pull IS the frame drop.
 	if _detect_task_id != -1:
 		return
+
+	# Past that guard nothing can be reading _marker_size_table on a worker thread, which makes this
+	# the only safe place to rewrite it -- so this is where an inspector edit to aruco_patch_size(s)
+	# on a RUNNING remote deploy reaches both solvePnP and the rendered boxes. See _sync_marker_sizes.
+	_sync_marker_sizes()
 
 	var readback_t0 := Time.get_ticks_usec()
 	var img := cam_texture.get_image()
