@@ -1,3 +1,6 @@
+# Named so consumers can type their reference to it (@export var marker_source: ArucoMarkerSource)
+# and get the public marker API below checked at edit time instead of as a runtime "Invalid call".
+class_name ArucoMarkerSource
 extends Node3D
 
 var processor: OpenCVProcessor
@@ -7,8 +10,10 @@ var processor: OpenCVProcessor
 # dictionary first) and only ever removed together with its node, one id can never own two nodes
 # nor swap onto another id's node. Main thread only -- detection tasks never touch it.
 var marker_nodes: Dictionary = {}
-# id -> Time.get_ticks_usec() of the last detection result that contained it; drives the deletion
-# grace period. Same lifetime as marker_nodes, kept in step with it.
+# id -> Time.get_ticks_usec() of the last detection result that contained it. Drives the patch
+# deletion grace period AND, since it is no longer erased when a patch is freed, the public
+# marker_age_ms() below -- a consumer asking "how stale is my last good pose?" must still get an
+# answer after the mesh is gone.
 var _marker_last_seen: Dictionary = {}
 # id -> resolved size in meters for the C++ side. Rebuilt by _sync_marker_sizes, which runs in
 # _ready and then once per dispatch in _process -- but ONLY while no detection task is in flight,
@@ -134,6 +139,93 @@ var _tcp_send_timer := 0.0
 const TCP_SEND_INTERVAL := 0.01
 
 #######################################################################################################
+# --- Public marker API -------------------------------------------------------------------------
+# Consumers (avatar rigs, debug gizmos) address markers by ID, never by patch node. The patch nodes
+# are created and freed at runtime, so a NodePath to one is null at scene load and dangling after a
+# dropout; an id is stable -- it is the key the detector itself uses. The patches are a debug
+# RENDERING of this data, not the data.
+# Main thread only, same as everything else that touches marker_nodes.
+
+## Ids contained in the detection result just applied. For one-shot reactions; polling the getters
+## below from _process is equally fine and is what the rigs do (this node is their parent, so its
+## _process has already run when theirs does).
+signal markers_updated(ids: Array)
+
+# id -> last known WORLD pose. Deliberately NOT pruned alongside the patch nodes: a consumer holding
+# its last good pose through a dropout needs the pose to outlive the mesh. DICT_4X4_50 bounds this
+# at 50 entries, so it cannot grow without limit.
+var _marker_poses: Dictionary = {}
+
+
+## Last known world pose. IDENTITY if never detected -- pair with has_marker() if that would be
+## indistinguishable from a real pose for you.
+func get_marker_pose(id: int) -> Transform3D:
+	return _marker_poses.get(id, Transform3D.IDENTITY)
+
+## True once this marker has been detected at least once. It may be stale by now.
+func has_marker(id: int) -> bool:
+	return _marker_poses.has(id)
+
+## Milliseconds since this marker was last detected; INF if never. INF compares correctly against
+## any max_age below, so a never-seen id is simply never fresh.
+func marker_age_ms(id: int) -> float:
+	if not _marker_last_seen.has(id):
+		return INF
+	return (Time.get_ticks_usec() - _marker_last_seen[id]) / 1000.0
+
+## True only if EVERY id is fresh -- a pose averaged over several markers is only as good as its
+## weakest one. Defaults to the patch nodes' own grace period, so "the debug box is on screen" and
+## "the consumer is tracking" stay the same statement.
+func markers_fresh(ids: Array, max_age_ms := PATCH_LOST_TIMEOUT_MS) -> bool:
+	for id in ids:
+		if marker_age_ms(id) > max_age_ms:
+			return false
+	return true
+
+## True once every id has been seen at least once, stale or not. Use this to decide whether a
+## consumer may be shown at all; markers_fresh() decides whether to move it.
+func markers_ever_seen(ids: Array) -> bool:
+	for id in ids:
+		if not _marker_poses.has(id):
+			return false
+	return true
+
+## Centroid + mean rotation of the given markers. Unknown ids are skipped; IDENTITY if none are
+## known.
+##
+## Sum-then-normalise is the cheap quaternion mean, and for exactly two markers it is identical to
+## slerp(q0, q1, 0.5). slerp cannot generalise it: it takes only two, and chaining it is not
+## associative, so the result would depend on marker order. Each quaternion is sign-aligned against
+## the first KNOWN one, because q and -q are the same rotation and would otherwise cancel instead
+## of average.
+func get_average_marker_pose(ids: Array) -> Transform3D:
+	var centre := Vector3.ZERO
+	var acc := Quaternion(0, 0, 0, 0)
+	var ref := Quaternion.IDENTITY
+	var n := 0
+	for id in ids:
+		if not _marker_poses.has(id):
+			continue
+		var x: Transform3D = _marker_poses[id]
+		var q := x.basis.get_rotation_quaternion()
+		# Counting KNOWN ids rather than using the loop index is what makes skipping safe: the
+		# reference is the first quaternion actually accumulated, not the first id asked for.
+		if n == 0:
+			ref = q
+		elif ref.dot(q) < 0.0:
+			q = -q
+		centre += x.origin
+		acc = Quaternion(acc.x + q.x, acc.y + q.y, acc.z + q.z, acc.w + q.w)
+		n += 1
+	if n == 0:
+		return Transform3D.IDENTITY
+	return Transform3D(Basis(acc.normalized()), centre / float(n))
+
+## The live debug patch node for an id, or null while the marker is undetected. Read poses through
+## get_marker_pose() -- this exists only for code that wants to touch the rendered box itself
+## (hiding it, recolouring it), and must be re-fetched every use since the node is freed on loss.
+func get_marker_node(id: int) -> Node3D:
+	return marker_nodes.get(id)
 
 # Single source of truth for a marker id's physical size: table entry if present and set,
 # aruco_patch_size otherwise. The bounds check doubles as the guard for arrays the inspector
@@ -177,6 +269,7 @@ func _sync_marker_sizes() -> void:
 			if debug_prints_enabled:
 				print("[opencv_aruco] [main_3d::_sync_marker_sizes] patch resized: id=%d size=%.3f" % [id, size])
 
+#######################################################################################################
 
 func _ready() -> void:
 	# The property setter already pushed this into the extension at scene-instantiation time; repeat
@@ -246,7 +339,7 @@ func _on_camera_feeds_updated() -> void:
 		for j in range(formats.size()):
 			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] format: index=%d value=%s" % [j, formats[j]])
 	if formats.size() > 2:
-		feed.set_format(2, {})        # feed format:10 1280x1280 YUV_420_888 (for now, choice can be altered) (good ArUco res, light on CPU)
+		feed.set_format(2, {})        # feed format:10 1280x1280 YUV_420_888, feed format:2 640x480
 	elif formats.size() > 0:
 		feed.set_format(0, {})
 
@@ -366,11 +459,14 @@ func _get_or_create_patch(id: int) -> Node3D:
 func _apply_detection_result() -> void:
 	var markers: Dictionary = _result_markers
 	var now_usec := Time.get_ticks_usec()
+	var seen_ids: Array = []
 	for id in markers:
 		# markers[id] is already WORLD space; freeze it there, so the head can move between
 		# detections without dragging the patch along.
+		_marker_poses[id] = markers[id]        # the id-keyed record the public API serves
 		_get_or_create_patch(id).global_transform = markers[id]
 		_marker_last_seen[id] = now_usec
+		seen_ids.append(id)
 
 	# Drop patches whose marker has been missing for longer than the grace period. Pruning runs
 	# HERE, on a fresh detection result, not on a timer: absence is only evidence that a marker is
@@ -383,10 +479,19 @@ func _apply_detection_result() -> void:
 			continue
 		marker_nodes[id].queue_free()
 		marker_nodes.erase(id)
-		_marker_last_seen.erase(id)
+		# _marker_last_seen is NOT erased with the node: it is the public freshness record behind
+		# marker_age_ms(), and a consumer asking "how stale is my last good pose?" must still get an
+		# answer after the mesh is gone. Safe because this loop keys off marker_nodes.keys(), so a
+		# leftover entry cannot resurrect a patch, and _get_or_create_patch rebuilds the node
+		# cleanly if the marker comes back. Bounded at 50 entries by DICT_4X4_50, same as
+		# _marker_poses.
 		if debug_prints_enabled:
 			print("[opencv_aruco] [main_3d::_apply_detection_result] patch deleted: id=%d unseen_ms=%.0f patches=%d" % [
 					id, unseen_usec / 1000.0, marker_nodes.size()])
+
+	# After the prune, so a handler reacting to this signal sees the final scene state.
+	if not seen_ids.is_empty():
+		markers_updated.emit(seen_ids)
 
 # Runs on a WorkerThreadPool thread: ONE frame's OpenCV detection (detectMarkers + solvePnP) off
 # the main thread. Touches only `processor`, read-only config and the _result_markers slot -- never
