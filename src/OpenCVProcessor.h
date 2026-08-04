@@ -11,8 +11,17 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
 #include <opencv2/core.hpp>
+#include <memory>
 
 using namespace godot;
+
+//ArucoNano is forward-declared, deliberately NOT included: aruco_nano.h defines three statics
+//without `inline` (visitedAwareTracingContour/getBorderErrors/thres255Adaptive), so including it
+//here would emit them in every translation unit pulling this header in -- register_types.cpp does
+//-- and the link fails on duplicate symbols. The header is included in OpenCVProcessor.cpp only,
+//which is why `detector` is held by pointer rather than by value. The destructor lives in the
+//.cpp, where the type is complete.
+namespace aruco_nano { class ArucoDetector; }
 
 class OpenCVProcessor : public Node {
     GDCLASS(OpenCVProcessor, Node)
@@ -21,7 +30,7 @@ private:
     //kept open across calls; opening DSHOW takes 1-3s, so reusing is essential for per-frame use
     cv::VideoCapture cap;
     //built once in ctor and reused; dictionary+params are baked in at construction
-    cv::aruco::ArucoDetector detector;
+    std::unique_ptr<aruco_nano::ArucoDetector> detector;
 
     //shared detect+solvePnP pipeline; frame is BGR. used by the godot-image path.
     //marker_sizes maps marker id -> physical side length (m); ids without an entry (or with a

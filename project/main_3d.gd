@@ -20,7 +20,7 @@ var _marker_size_table: Dictionary = {}
 @export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_size := 0.1
 
 # Ground-truth lookup table: index = marker id (0-9), value = physical side length in meters.
-# 0 = unset -> that id falls back to aruco_patch_size (as do all ids >= 10 of DICT_4X4_50), so
+# 0 = unset -> that id falls back to aruco_patch_size (as do all ids >= 10 of ARUCO_MIP_36h12), so
 # an untouched table behaves exactly like the single-size setup before it existed.
 @export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_sizes: Array[float] = [
 	0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
