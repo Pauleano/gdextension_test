@@ -1,3 +1,6 @@
+# Named so consumers can type their reference to it (@export var marker_source: ArucoMarkerSource)
+# and get the public marker API below checked at edit time instead of as a runtime "Invalid call".
+class_name ArucoMarkerSource
 extends Node3D
 
 var processor: OpenCVProcessor
@@ -7,11 +10,15 @@ var processor: OpenCVProcessor
 # dictionary first) and only ever removed together with its node, one id can never own two nodes
 # nor swap onto another id's node. Main thread only -- detection tasks never touch it.
 var marker_nodes: Dictionary = {}
-# id -> Time.get_ticks_usec() of the last detection result that contained it; drives the deletion
-# grace period. Same lifetime as marker_nodes, kept in step with it.
+# id -> Time.get_ticks_usec() of the last detection result that contained it. Drives the patch
+# deletion grace period AND, since it is no longer erased when a patch is freed, the public
+# marker_age_ms() below -- a consumer asking "how stale is my last good pose?" must still get an
+# answer after the mesh is gone.
 var _marker_last_seen: Dictionary = {}
-# id -> resolved size in meters for the C++ side; built once in _ready and read-only afterwards
-# (detection tasks read it without a lock -- safe because no task is dispatched before _ready ends).
+# id -> resolved size in meters for the C++ side. Rebuilt by _sync_marker_sizes, which runs in
+# _ready and then once per detection task start -- and ONLY there, because that is the one point
+# in the frame at which no task is in flight, so the unlocked read in _detect_frame can never
+# overlap a write.
 var _marker_size_table: Dictionary = {}
 
 # Fallback physical side length, in meters, for every marker id WITHOUT a table entry below.
@@ -81,8 +88,8 @@ var _patch_mesh := BoxMesh.new()
 # The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
 # camera axes -> raw values, no sign flips. If markers land in the wrong place, the axis
 # convention is the knob: try the conjugate quaternion / flipped translation signs.
-@export var lens_rotation_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
-@export var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378)
+@export var lens_rotation_raw := Quaternion(-0.99518352746964, 0.0030334177427, -0.00252024177462, 0.09795006364584)
+@export var lens_translation := Vector3(-0.03238632902503, -0.01766911894083, -0.06318981945515)
 # Derived ONCE from the exported raw values in _ready (before any detection task can exist).
 var _lens_pose := Transform3D.IDENTITY
 
@@ -101,11 +108,34 @@ var android_camera: AndroidCamera
 var _android_cam_started := false
 var _cam_clock_offset_ns := 0          # camera timestamp clock ns - Godot ticks ns
 var _cam_ts_realtime := false          # feed stamps on boottime ("realtime") vs CLOCK_MONOTONIC ("unknown")
+# Second clock bridge, for XrTime (CLOCK_MONOTONIC ns on the Quest) -> Godot ticks. Kept separate
+# from _cam_clock_offset_ns because that one follows the FEED's clock, which is boottime for a
+# "realtime" feed and would be wrong for pdt. On the Quest passthrough path ("unknown" -> also
+# monotonic) the two hold the same value, and that is what makes an error in the offset cancel
+# out of the pose lookup entirely -- see _resample_clock_offsets and _process.
+var _xr_clock_offset_ns := 0
+var _xr_stamp_poses := false           # stamp history entries with pdt instead of "now" (Quest only)
+var _xr_lead_usec := 0                 # last measured pdt - now, carried over if pdt is briefly 0
 var _cam_frame_count := 0
 var _cam_fallback_count := 0           # frames whose timestamp failed the plausibility guard
 var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
 var _xr_api: OpenXRAPIExtension        # access to xrWaitFrame's predicted display time (XrTime)
 var _lead_print_timer := 0.0
+# Accumulators for the pdt/_process lockstep check (see the block in _process). Sampled EVERY
+# frame, printed once per second: a per-frame print through logcat at the render rate would slow
+# down the very loop being measured. _pdt_prev survives the window reset, so the first delta of a
+# window is measured against the last frame of the previous one.
+var _pdt_prev := 0                     # pdt of the previous _process; 0 = nothing sampled yet
+var _pdt_prev_now_usec := 0            # Time.get_ticks_usec() of that same _process
+var _pdt_deltas := 0                   # frame-to-frame deltas accumulated in this window
+var _pdt_dupes := 0                    # deltas of exactly 0 -> pdt did NOT advance (the failure mode)
+var _pdt_advance_ns := 0               # summed pdt deltas over the window
+var _pdt_wall_advance_usec := 0        # summed wall-clock deltas over the same frames
+var _pdt_delta_min_ns := 0
+var _pdt_delta_max_ns := 0
+var _lead_sum_ms := 0.0
+var _lead_min_ms := 0.0
+var _lead_max_ms := 0.0
 @onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 @onready var xr_origin: XROrigin3D = $XROrigin3D
 @onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
@@ -140,14 +170,16 @@ var _result_cam_xform := Transform3D.IDENTITY   # head pose the markers were bak
 # only the fallback guess for the desktop CameraServer path, where no timestamp exists.
 const CAMERA_LATENCY_MS := 50.0
 
-# Residual timing bias of the pose lookup on the Android path, in ms; positive = use an OLDER
-# head pose. The sensor timestamp removes the VARIABLE pipeline delay, but two small static
-# offsets remain unknowable from GDScript: the head poses Godot reports are OpenXR poses
-# PREDICTED for the upcoming display time (~1-3 frame periods ahead of _process), and the clock
-# base of an "unknown" timestamp_source is only typically monotonic. Tune on device like
-# CAMERA_LATENCY_MS before: patch drags WITH the head during motion -> raise; patch lags
-# BEHIND the real marker -> lower (may go negative).
-@export_range(10,100,0.1,"or_greater","suffix:ms") var POSE_LOOKUP_BIAS_MS := 35.0
+# Residual trim of the pose lookup on the Android path, in ms; positive = use an OLDER head pose.
+# Expected to stay at 0: the two error sources this used to absorb are both measured now. The
+# sensor timestamp removes the variable pipeline delay, and stamping every history entry with its
+# own predicted display time (see _process) removes the OpenXR prediction lead -- which is not a
+# constant anyway, it moves with render load and sawtooths ~40ms peak-to-peak. What is left is
+# only what neither can see: a possible constant one-frame stagger between pdt and the pose read
+# beside it, and whether the sensor timestamp marks the start or the middle of the exposure.
+# Tune on device like CAMERA_LATENCY_MS: patch drags WITH the head during motion -> raise; patch
+# lags BEHIND the real marker -> lower.
+@export_range(-20,20,0.1,"or_greater","or_less","suffix:ms") var POSE_LOOKUP_TRIM_MS := 0.0
 
 var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
 
@@ -178,6 +210,94 @@ const TCP_SEND_INTERVAL := 0.01
 
 #######################################################################################################
 
+# --- Public marker API -------------------------------------------------------------------------
+# Consumers (avatar rigs, debug gizmos) address markers by ID, never by patch node. The patch nodes
+# are created and freed at runtime, so a NodePath to one is null at scene load and dangling after a
+# dropout; an id is stable -- it is the key the detector itself uses. The patches are a debug
+# RENDERING of this data, not the data.
+# Main thread only, same as everything else that touches marker_nodes.
+
+## Ids contained in the detection result just applied. For one-shot reactions; polling the getters
+## below from _process is equally fine and is what the rigs do (this node is their parent, so its
+## _process has already run when theirs does).
+signal markers_updated(ids: Array)
+
+# id -> last known WORLD pose. Deliberately NOT pruned alongside the patch nodes: a consumer holding
+# its last good pose through a dropout needs the pose to outlive the mesh. ARUCO_MIP_36h12 bounds
+# this at 250 entries, so it cannot grow without limit.
+var _marker_poses: Dictionary = {}
+
+
+## Last known world pose. IDENTITY if never detected -- pair with has_marker() if that would be
+## indistinguishable from a real pose for you.
+func get_marker_pose(id: int) -> Transform3D:
+	return _marker_poses.get(id, Transform3D.IDENTITY)
+
+## True once this marker has been detected at least once. It may be stale by now.
+func has_marker(id: int) -> bool:
+	return _marker_poses.has(id)
+
+## Milliseconds since this marker was last detected; INF if never. INF compares correctly against
+## any max_age below, so a never-seen id is simply never fresh.
+func marker_age_ms(id: int) -> float:
+	if not _marker_last_seen.has(id):
+		return INF
+	return (Time.get_ticks_usec() - _marker_last_seen[id]) / 1000.0
+
+## True only if EVERY id is fresh -- a pose averaged over several markers is only as good as its
+## weakest one. Defaults to the patch nodes' own grace period, so "the debug box is on screen" and
+## "the consumer is tracking" stay the same statement.
+func markers_fresh(ids: Array, max_age_ms := PATCH_LOST_TIMEOUT_MS) -> bool:
+	for id in ids:
+		if marker_age_ms(id) > max_age_ms:
+			return false
+	return true
+
+## True once every id has been seen at least once, stale or not. Use this to decide whether a
+## consumer may be shown at all; markers_fresh() decides whether to move it.
+func markers_ever_seen(ids: Array) -> bool:
+	for id in ids:
+		if not _marker_poses.has(id):
+			return false
+	return true
+
+## Centroid + mean rotation of the given markers. Unknown ids are skipped; IDENTITY if none are
+## known.
+##
+## Sum-then-normalise is the cheap quaternion mean, and for exactly two markers it is identical to
+## slerp(q0, q1, 0.5). slerp cannot generalise it: it takes only two, and chaining it is not
+## associative, so the result would depend on marker order. Each quaternion is sign-aligned against
+## the first KNOWN one, because q and -q are the same rotation and would otherwise cancel instead
+## of average.
+func get_average_marker_pose(ids: Array) -> Transform3D:
+	var centre := Vector3.ZERO
+	var acc := Quaternion(0, 0, 0, 0)
+	var ref := Quaternion.IDENTITY
+	var n := 0
+	for id in ids:
+		if not _marker_poses.has(id):
+			continue
+		var x: Transform3D = _marker_poses[id]
+		var q := x.basis.get_rotation_quaternion()
+		# Counting KNOWN ids rather than using the loop index is what makes skipping safe: the
+		# reference is the first quaternion actually accumulated, not the first id asked for.
+		if n == 0:
+			ref = q
+		elif ref.dot(q) < 0.0:
+			q = -q
+		centre += x.origin
+		acc = Quaternion(acc.x + q.x, acc.y + q.y, acc.z + q.z, acc.w + q.w)
+		n += 1
+	if n == 0:
+		return Transform3D.IDENTITY
+	return Transform3D(Basis(acc.normalized()), centre / float(n))
+
+## The live debug patch node for an id, or null while the marker is undetected. Read poses through
+## get_marker_pose() -- this exists only for code that wants to touch the rendered box itself
+## (hiding it, recolouring it), and must be re-fetched every use since the node is freed on loss.
+func get_marker_node(id: int) -> Node3D:
+	return marker_nodes.get(id)
+
 # Single source of truth for a marker id's physical size: table entry if present and set,
 # aruco_patch_size otherwise. The bounds check doubles as the guard for arrays the inspector
 # resized to fewer/more than 10 elements.
@@ -187,6 +307,39 @@ func _marker_size_for(id: int) -> float:
 		if s > 0.0:
 			return s
 	return aruco_patch_size
+
+
+# Re-resolve aruco_patch_sizes/aruco_patch_size into the id -> size table the C++ side gets, and put
+# the same numbers on the live patch meshes. Both consumers of a marker's size are refreshed here,
+# so they can never drift apart.
+# CALLER CONTRACT: main thread, and only while _detect_task_id == -1. _detect_frame reads
+# _marker_size_table from a worker thread without a lock, so this is the one point in the frame at
+# which rewriting it is safe -- which is why the only call site is _start_detection_task, covering
+# both the fresh-frame and the pending-frame path with one call. Cheap enough to run per task: ten
+# dictionary writes plus one scale compare per live patch.
+func _sync_marker_sizes() -> void:
+	for id in aruco_patch_sizes.size():
+		_marker_size_table[id] = _marker_size_for(id)
+	# Rows the inspector shrank the array past must go, else a deleted entry would keep feeding
+	# solvePnP its old size instead of falling back to aruco_patch_size. keys() is a copy, so
+	# erasing inside the loop is safe.
+	for id in _marker_size_table.keys():
+		if id >= aruco_patch_sizes.size():
+			_marker_size_table.erase(id)
+	# Existing patches got their scale once, at creation time (_get_or_create_patch). Without this
+	# a size change would only reach the mesh after the marker had been lost for
+	# PATCH_LOST_TIMEOUT_MS and the node was rebuilt -- the box would keep its old edge length while
+	# the pose already used the new one. Compared approximately because scale components are 32-bit:
+	# an exact != against the double from _marker_size_for would fire every single time.
+	for id in marker_nodes:
+		var size := _marker_size_for(id)
+		# The one child added in _get_or_create_patch; the patch node itself must stay scale-free,
+		# it carries the baked pose.
+		var mesh_instance: MeshInstance3D = marker_nodes[id].get_child(0)
+		if not is_equal_approx(mesh_instance.scale.x, size):
+			mesh_instance.scale = Vector3(size, size, PATCH_THICKNESS)
+			if debug_prints_enabled:
+				print("[opencv_aruco] [main_3d::_sync_marker_sizes] patch resized: id=%d size=%.3f" % [id, size])
 
 
 func _ready() -> void:
@@ -204,10 +357,11 @@ func _ready() -> void:
 	# No patch nodes to find: they are created on demand as markers turn up (see
 	# _get_or_create_patch) and freed again when they stop being detected.
 
-	# Resolve the size table once for the C++ side (entries are pre-resolved through
-	# _marker_size_for, so the C++ default only fires for ids >= the table length).
-	for id in aruco_patch_sizes.size():
-		_marker_size_table[id] = _marker_size_for(id)
+	# Resolve the size table for the C++ side (entries are pre-resolved through _marker_size_for, so
+	# the C++ default only fires for ids >= the table length). Re-run before every detection task
+	# from _start_detection_task, so inspector edits reach solvePnP and the patch meshes while the
+	# scene is running instead of being frozen at whatever _ready saw.
+	_sync_marker_sizes()
 
 	# No worker setup needed: detection runs as one-shot WorkerThreadPool tasks, dispatched on
 	# demand once frames arrive (see _dispatch_detection) -- long after _ready has finished.
@@ -316,8 +470,12 @@ func _start_android_camera() -> void:
 	# monotonic feed is off by the headset's accumulated doze time since boot -- a silent,
 	# run-dependent bias that made patches lag behind head motion.
 	_cam_ts_realtime = str(cameras.get(cam_id, {}).get("timestamp_source", "unknown")) == "realtime"
-	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
-			else android_camera.get_monotonic_clock_offset_nanos()
+	_resample_clock_offsets()
+	# From here on the head-pose history is stamped with xrWaitFrame's predicted display time
+	# rather than "now" (see _process). Allocated once, up front: it is on the per-frame path now,
+	# not a debug-only diagnostic. A frame where the runtime reports no pdt falls back gracefully.
+	_xr_api = OpenXRAPIExtension.new()
+	_xr_stamp_poses = true
 	if debug_prints_enabled:
 		print("[opencv_aruco] [main_3d::_start_android_camera] starting camera: id=%s clock=%s feeds=%s" % [
 				cam_id, "realtime" if _cam_ts_realtime else "monotonic", cameras])
@@ -327,6 +485,16 @@ func _start_android_camera() -> void:
 	# 640x480 matches the hardcoded intrinsics; LUMA is the camera's native Y plane, which is
 	# exactly the 1-channel grayscale the C++ detector consumes -- no conversion anywhere.
 	android_camera.start_camera(640, 480, false, cam_id, 0, 0, AndroidCamera.OutputFormat.LUMA)
+
+# Both clock bridges in ONE place so they can never drift apart. That matters: the pose lookup
+# compares a camera timestamp mapped with _cam_clock_offset_ns against a history entry mapped with
+# _xr_clock_offset_ns, so an error COMMON to both cancels out, while a divergence between them
+# becomes a silent bias. On the Quest passthrough feed ("unknown" -> monotonic) they are literally
+# the same number; only a "realtime" feed splits them, and then each is individually correct.
+func _resample_clock_offsets() -> void:
+	_xr_clock_offset_ns = android_camera.get_monotonic_clock_offset_nanos()
+	_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
+			else _xr_clock_offset_ns
 
 # Runs on the main thread (plugin signals are marshalled onto the engine loop). data is the
 # tight-packed Y plane; timestamp_ns is the sensor timestamp (start of exposure) of THIS frame.
@@ -338,8 +506,7 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 	var cap_usec := (timestamp_ns - _cam_clock_offset_ns) / 1000
 	var used_fallback := false
 	if cap_usec > now_usec or now_usec - cap_usec > 500_000:
-		_cam_clock_offset_ns = android_camera.get_clock_offset_nanos() if _cam_ts_realtime \
-				else android_camera.get_monotonic_clock_offset_nanos()
+		_resample_clock_offsets()
 		cap_usec = (timestamp_ns - _cam_clock_offset_ns) / 1000
 		if cap_usec > now_usec or now_usec - cap_usec > 500_000:
 			_cam_fallback_count += 1
@@ -357,18 +524,19 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (2) exposure time on godot clock: cap_usec=%d age_ms=%.1f source=%s" % [
 				frame_id, cap_usec, lag_ms, "FALLBACK_GUESS_timestamp_rejected" if used_fallback else "sensor_timestamp"])
 
-	cap_usec -= int(POSE_LOOKUP_BIAS_MS * 1000.0)
+	# The lookup target is the exposure time itself: the history entries carry the time their pose
+	# actually describes, so the two timelines already line up and only the residual trim is left.
+	# cap_usec itself is NOT shifted -- it travels on as the frame's true age (see frame_age_ms).
+	var lookup_usec := cap_usec - int(POSE_LOOKUP_TRIM_MS * 1000.0)
 	if traced:
-		# (3) the stored head poses are predicted ~POSE_LOOKUP_BIAS_MS into the future, so the
-		# lookup target is shifted back by the same amount to line the two timelines up.
-		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (3) pose lookup target: target_usec=%d bias_ms=%.1f (compensates OpenXR predicting head poses ahead of time)" % [
-				frame_id, cap_usec, POSE_LOOKUP_BIAS_MS])
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (3) pose lookup target: target_usec=%d trim_ms=%.1f (history is pdt-stamped, so no prediction lead to undo)" % [
+				frame_id, lookup_usec, POSE_LOOKUP_TRIM_MS])
 
 	# Head pose at the frame's capture time, sampled at ARRIVAL. The lookup is history-based, so
 	# sampling here or after the detection gives the same pose -- but sampled here it can travel
 	# with the frame, and the C++ side applies it together with the lens pose (markers come back
 	# in world space).
-	var cam_xform := _head_pose_at(cap_usec)
+	var cam_xform := _head_pose_at(lookup_usec)
 	if traced:
 		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (4) head pose at capture: pos=%v (travels with the frame)" % [
 				frame_id, cam_xform.origin])
@@ -403,28 +571,83 @@ func _process(_delta: float) -> void:
 
 	# Head-pose history: one [t_usec, pose] sample per rendered frame, so a finished detection can
 	# be baked with the pose the head actually had at the frame's capture time (see _head_pose_at).
+	#
+	# Each sample is stamped with the time its pose DESCRIBES, not the time it was read. OpenXR
+	# hands out poses PREDICTED for xrWaitFrame's display time, so stamping them with "now" was a
+	# per-sample lie that a single constant could only ever cancel on average. Measured on the
+	# Quest, that lead is 40-80ms and not constant in either direction: it shrinks as the render
+	# rate rises (~79ms at 34fps down to ~65ms at 56fps) and sawtooths ~40ms peak-to-peak within
+	# that, because pdt steps in whole 13.89ms display quanta while the wall clock runs on. Giving
+	# every entry its own pdt cancels all of it, hitches included.
+	# The camera's sensor timestamp is mapped onto Godot ticks with the same monotonic offset
+	# (see _resample_clock_offsets), so an error in that offset cancels here instead of biasing.
 	var now_usec := Time.get_ticks_usec()
-	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
-	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
+	var pdt := 0
+	var pose_usec := now_usec + _xr_lead_usec    # desktop: lead stays 0 -> stamped with "now"
+	if _xr_stamp_poses:
+		pdt = _xr_api.get_predicted_display_time()
+		if pdt != 0:
+			pose_usec = (pdt - _xr_clock_offset_ns) / 1000
+			_xr_lead_usec = pose_usec - now_usec
+	_xr_cam_pose_history.append([pose_usec, xr_camera.global_transform])
+	# Pruned against the NEWEST stamp rather than now_usec: the entries sit in the future once
+	# they are pdt-stamped, and measuring the window from "now" would silently shorten it.
+	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < pose_usec - 500_000:
 		_xr_cam_pose_history.pop_front()
 
-	# Measure the OpenXR pose-prediction lead: xrWaitFrame's predicted display time (XrTime =
-	# CLOCK_MONOTONIC ns on the Quest) minus "now" on that same clock (the camera clock offset
-	# maps Godot ticks -> monotonic ns). This is how far in the FUTURE the pose stored above
-	# actually is -- the measured value to use for POSE_LOOKUP_BIAS_MS instead of guessing.
+	# Health check for the stamping above: it is only valid if the pdt read this frame belongs to
+	# the pose read beside it, i.e. if pdt advances exactly once per _process. When it does, the
+	# summed pdt deltas over any window equal the summed wall-clock deltas, because both telescope
+	# to (last - first):
+	#   ratio ~ 1.00, dupes = 0   -> lockstep, stamping is sound
+	#   dupes > 0, ratio < 1      -> pdt repeats across _process calls; it is stale on those
+	#                                frames and the stamps carry a VARIABLE error
+	#   ratio > 1                 -> pdt skips ahead of the main loop
+	# Per-line ratio scatter of a few percent is expected and benign: it is exactly the lead's
+	# drift across that window divided by the window length, not a desync. pdt_delta_ms should
+	# land on integer multiples of the display period (13.89ms at 72Hz), the minimum being one.
+	# NOTE this cannot detect a CONSTANT one-frame stagger -- that keeps ratio at 1.00 with no
+	# dupes, hiding entirely in the absolute offset. It rules out the variable failure only; the
+	# constant residual is what POSE_LOOKUP_TRIM_MS is for.
 	# Only on the Android plugin path with a monotonic offset; skipped entirely on desktop.
-	# Purely diagnostic, so it is gated as a whole: with debug off we neither allocate the
-	# OpenXRAPIExtension nor query it.
-	if debug_prints_enabled and _android_cam_started and not _cam_ts_realtime:
+	if debug_prints_enabled and _xr_stamp_poses and not _cam_ts_realtime:
+		if pdt != 0:
+			# The very first frame only seeds the reference; every later frame contributes one delta.
+			if _pdt_prev != 0:
+				var d_pdt_ns := pdt - _pdt_prev
+				var lead_ms := float(pdt - (now_usec * 1000 + _xr_clock_offset_ns)) / 1.0e6
+				if _pdt_deltas == 0:      # first delta of a fresh window seeds the extremes
+					_pdt_delta_min_ns = d_pdt_ns
+					_pdt_delta_max_ns = d_pdt_ns
+					_lead_min_ms = lead_ms
+					_lead_max_ms = lead_ms
+				else:
+					_pdt_delta_min_ns = mini(_pdt_delta_min_ns, d_pdt_ns)
+					_pdt_delta_max_ns = maxi(_pdt_delta_max_ns, d_pdt_ns)
+					_lead_min_ms = minf(_lead_min_ms, lead_ms)
+					_lead_max_ms = maxf(_lead_max_ms, lead_ms)
+				if d_pdt_ns == 0:
+					_pdt_dupes += 1
+				_pdt_deltas += 1
+				_pdt_advance_ns += d_pdt_ns
+				_pdt_wall_advance_usec += now_usec - _pdt_prev_now_usec
+				_lead_sum_ms += lead_ms
+			_pdt_prev = pdt
+			_pdt_prev_now_usec = now_usec
+
 		_lead_print_timer += _delta
-		if _lead_print_timer >= 1.0:
+		if _lead_print_timer >= 1.0 and _pdt_deltas > 0 and _pdt_wall_advance_usec > 0:
 			_lead_print_timer = 0.0
-			if _xr_api == null:
-				_xr_api = OpenXRAPIExtension.new()
-			var pdt := _xr_api.get_predicted_display_time()
-			if pdt != 0:
-				var lead_ms := float(pdt - (now_usec * 1000 + _cam_clock_offset_ns)) / 1.0e6
-				print("[opencv_aruco] [main_3d::_process] openxr pose prediction: lead_ms=%.2f" % lead_ms)
+			print("[opencv_aruco] [main_3d::_process] openxr pdt sync: frames=%d dupes=%d ratio=%.4f pdt_delta_ms=%.2f..%.2f lead_ms=%.2f (%.2f..%.2f)" % [
+					_pdt_deltas, _pdt_dupes,
+					float(_pdt_advance_ns) / float(_pdt_wall_advance_usec * 1000),
+					_pdt_delta_min_ns / 1.0e6, _pdt_delta_max_ns / 1.0e6,
+					_lead_sum_ms / _pdt_deltas, _lead_min_ms, _lead_max_ms])
+			_pdt_deltas = 0
+			_pdt_dupes = 0
+			_pdt_advance_ns = 0
+			_pdt_wall_advance_usec = 0
+			_lead_sum_ms = 0.0
 
 	# (a) Collect the latest finished detection and bake it into the scene (main thread ->
 	# scene-tree writes are safe here); also re-fills the task slot from the pending frame.
@@ -503,6 +726,11 @@ func _poll_detection_task() -> void:
 					frame_id, _detect_task_id])
 
 func _start_detection_task(img: Image, capture_usec: int, cam_xform: Transform3D, frame_id: int) -> void:
+	# The one safe moment to rewrite _marker_size_table: main thread, no task in flight (the id is
+	# assigned on the very next line). Both entry points -- a fresh frame from _dispatch_detection
+	# and a parked one from _poll_detection_task -- come through here, so the contract holds without
+	# either caller having to know about it.
+	_sync_marker_sizes()
 	_detect_task_id = WorkerThreadPool.add_task(_detect_frame.bind(img, capture_usec, cam_xform, frame_id),
 			false, "opencv_aruco marker detection")
 
@@ -553,11 +781,14 @@ func _apply_detection_result() -> void:
 		print("[opencv_aruco] [main_3d::_apply_detection_result] flow #%d (9) head pose at capture: pos=%v live_pos=%v drift_cm=%.1f turn_deg=%.1f" % [
 				result_id, _result_cam_xform.origin, live_xform.origin, drift_cm, turn_deg])
 	var now_usec := Time.get_ticks_usec()
+	var seen_ids: Array = []
 	for id in markers:
 		# markers[id] is already WORLD space; freeze it there, so the head can move between
 		# detections without dragging the patch along.
+		_marker_poses[id] = markers[id]        # the id-keyed record the public API serves
 		_get_or_create_patch(id).global_transform = markers[id]
 		_marker_last_seen[id] = now_usec
+		seen_ids.append(id)
 		if _tracing(result_id):
 			# frozen at this world pose until the next detection
 			print("[opencv_aruco] [main_3d::_apply_detection_result] flow #%d (10) marker assigned: id=%d world_pos=%v" % [
@@ -574,10 +805,19 @@ func _apply_detection_result() -> void:
 			continue
 		marker_nodes[id].queue_free()
 		marker_nodes.erase(id)
-		_marker_last_seen.erase(id)
+		# _marker_last_seen is NOT erased with the node: it is the public freshness record behind
+		# marker_age_ms(), and a consumer asking "how stale is my last good pose?" must still get an
+		# answer after the mesh is gone. Safe because this loop keys off marker_nodes.keys(), so a
+		# leftover entry cannot resurrect a patch, and _get_or_create_patch rebuilds the node
+		# cleanly if the marker comes back. Bounded at 250 entries by ARUCO_MIP_36h12, same as
+		# _marker_poses.
 		if debug_prints_enabled:
 			print("[opencv_aruco] [main_3d::_apply_detection_result] patch deleted: id=%d unseen_ms=%.0f patches=%d" % [
 					id, unseen_usec / 1000.0, marker_nodes.size()])
+
+	# After the prune, so a handler reacting to this signal sees the final scene state.
+	if not seen_ids.is_empty():
+		markers_updated.emit(seen_ids)
 
 # Runs on a WorkerThreadPool thread: ONE frame's OpenCV detection (detectMarkers + solvePnP) off
 # the main thread. Touches only `processor`, read-only config and the _result_* slot -- never the
@@ -617,7 +857,8 @@ func _detect_frame(img: Image, capture_usec: int, cam_xform: Transform3D, frame_
 
 
 # Head pose at t_usec, interpolated between the two nearest history samples (the raw history has
-# one sample per rendered frame, ~14ms at 72fps; interpolating removes that quantisation).
+# one sample per RENDERED frame -- ~19ms at the ~55fps this hits on the Quest, which is below the
+# 72Hz display rate; interpolating removes that quantisation).
 # Falls back to the oldest/newest sample (or the live pose) at the edges of the history.
 func _head_pose_at(t_usec: int) -> Transform3D:
 	if _xr_cam_pose_history.is_empty():
