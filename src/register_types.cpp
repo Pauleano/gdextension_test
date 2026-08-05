@@ -6,6 +6,7 @@
 #include <godot_cpp/godot.hpp>
 
 #include "OpenCVProcessor.h"
+#include "OpenXRHeadLocator.h"
 
 using namespace godot;
 
@@ -15,6 +16,7 @@ void initialize_gdextension_types(ModuleInitializationLevel p_level)
 		return;
 	}
 	GDREGISTER_CLASS(OpenCVProcessor);
+	GDREGISTER_CLASS(OpenXRHeadLocator);
 }
 
 void uninitialize_gdextension_types(ModuleInitializationLevel p_level) {

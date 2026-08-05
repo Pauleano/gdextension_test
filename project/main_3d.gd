@@ -61,6 +61,9 @@ var _patch_mesh := BoxMesh.new()
 		# scene instantiation applies exported values before _ready -> the flag is already correct
 		# when the (printing) C++ constructor runs.
 		OpenCVProcessor.set_debug_prints_enabled(value)
+		# Same deal for the second extension class; both statics are pushed from this one place so
+		# a toggle in the remote inspector reaches every C++ log line, not just some of them.
+		OpenXRHeadLocator.set_debug_prints_enabled(value)
 
 # --- Camera calibration (left Quest passthrough camera "50", native 640x480 frame) ---
 # Exported so they can be tuned in the inspector instead of hunting through code. Read-only
@@ -121,6 +124,28 @@ var _cam_fallback_count := 0           # frames whose timestamp failed the plaus
 var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
 var _xr_api: OpenXRAPIExtension        # access to xrWaitFrame's predicted display time (XrTime)
 var _lead_print_timer := 0.0
+
+# --- xrLocateSpace head pose (the measured alternative to the predicted history) ---
+# The pose history below holds poses OpenXR PREDICTED for a display time; even stamped with the
+# instant they describe, they are forecasts, and the predictor's error rides into every marker
+# pose. _head_locator asks the runtime for the head pose at an arbitrary XrTime instead -- for a
+# time in the PAST that is the fused, after-the-fact estimate, i.e. measured rather than guessed.
+# Null when OpenXR is not initialised (desktop without a headset); every use is guarded.
+var _head_locator: OpenXRHeadLocator
+# true = xrLocateSpace at the frame's capture time, false = the pdt-stamped pose history and
+# _head_pose_at. ON since the once-a-second "openxr locate check" lines passed on the Quest:
+# (A) locating at pdt reproduces XRCamera3D to 0.02-0.3mm, so the VIEW space and the world
+# conversion are right, and (B) pdt-60ms comes back valid and tracked with 1-31mm of head motion
+# against the live pose, so this runtime really does serve measured history rather than clamping
+# to the newest pose. Flip it back to compare the two on device -- a frame the locator cannot
+# answer already falls back to the history by itself, so neither setting can strand the app.
+@export var use_xr_locate_space := true
+var _locate_check_timer := 0.0
+var _locate_fallback_count := 0        # frames on which the locator had no valid pose
+# How far into the past the (B) probe asks, in ms. Chosen to sit at the far end of the real
+# camera latency (sensor timestamp lags ~30-60ms here), so a runtime that only keeps a short
+# tracking history fails the probe rather than passing it and then failing on real frames.
+const LOCATE_PAST_PROBE_MS := 60.0
 # Accumulators for the pdt/_process lockstep check (see the block in _process). Sampled EVERY
 # frame, printed once per second: a per-frame print through logcat at the render rate would slow
 # down the very loop being measured. _pdt_prev survives the window reset, so the first delta of a
@@ -366,6 +391,11 @@ func _ready() -> void:
 	# No worker setup needed: detection runs as one-shot WorkerThreadPool tasks, dispatched on
 	# demand once frames arrive (see _dispatch_detection) -- long after _ready has finished.
 
+	# BEFORE the camera branch below, which can start delivering frames synchronously: those
+	# frames want the locator. Safe to do here -- xr_startup.gd sits on the XROrigin3D CHILD, and
+	# Godot runs a child's _ready before its parent's, so OpenXR is already initialised.
+	_setup_xr_locator()
+
 	if OS.get_name() == "Android" and Engine.has_singleton("GodotAndroidCamera"):
 		# Quest: the GodotAndroidCamera plugin (CameraX) pushes frames to _on_android_camera_frame
 		# as raw CPU bytes with a sensor timestamp -- no CameraServer, no GPU->CPU readback.
@@ -385,9 +415,32 @@ func _ready() -> void:
 		CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 		_on_camera_feeds_updated()                          # in case a feed is already present
 
-	
+
 	_connect_tcp()
-	
+
+# Build the OpenXR head locator, or leave it null when there is no OpenXR at all (desktop run
+# without a headset) -- every caller checks, and _xr_api is tied to the same condition so nothing
+# below ever pokes a dead OpenXRAPI singleton once per frame.
+# The VIEW space the C++ side creates is a CHILD of the XR session: the runtime destroys it with
+# the session, so it has to be given up on session_stopping. The node's destructor is too late --
+# by scene teardown the session is usually already gone (release() detects that and skips the
+# xrDestroySpace, but the signal is the path that actually cleans up properly).
+func _setup_xr_locator() -> void:
+	var xr_interface: XRInterface = XRServer.find_interface("OpenXR")
+	if xr_interface == null or not xr_interface.is_initialized():
+		if debug_prints_enabled:
+			print("[opencv_aruco] [main_3d::_setup_xr_locator] no OpenXR: head locator disabled, pose history stays the only path")
+		return
+	_xr_api = OpenXRAPIExtension.new()
+	_head_locator = OpenXRHeadLocator.new()
+	add_child(_head_locator)
+	# connect() by NAME, not xr_interface.session_stopping.connect(): the var is statically typed
+	# XRInterface, which has no such signal -- only the OpenXRInterface behind it does.
+	if xr_interface.has_signal("session_stopping"):
+		xr_interface.connect("session_stopping", Callable(_head_locator, "release"))
+	if debug_prints_enabled:
+		print("[opencv_aruco] [main_3d::_setup_xr_locator] head locator created: use_xr_locate_space=%s (validation prints once a second while debug is on)" % use_xr_locate_space)
+
 func _on_camera_feeds_updated() -> void:
 	if cam_texture != null:
 		return                                          # already initialised
@@ -472,10 +525,10 @@ func _start_android_camera() -> void:
 	_cam_ts_realtime = str(cameras.get(cam_id, {}).get("timestamp_source", "unknown")) == "realtime"
 	_resample_clock_offsets()
 	# From here on the head-pose history is stamped with xrWaitFrame's predicted display time
-	# rather than "now" (see _process). Allocated once, up front: it is on the per-frame path now,
-	# not a debug-only diagnostic. A frame where the runtime reports no pdt falls back gracefully.
-	_xr_api = OpenXRAPIExtension.new()
-	_xr_stamp_poses = true
+	# rather than "now" (see _process). _xr_api is built in _setup_xr_locator, which runs first
+	# and is the single point that decides whether this deploy has OpenXR at all; a frame where
+	# the runtime reports no pdt falls back gracefully.
+	_xr_stamp_poses = _xr_api != null
 	if debug_prints_enabled:
 		print("[opencv_aruco] [main_3d::_start_android_camera] starting camera: id=%s clock=%s feeds=%s" % [
 				cam_id, "realtime" if _cam_ts_realtime else "monotonic", cameras])
@@ -532,14 +585,34 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (3) pose lookup target: target_usec=%d trim_ms=%.1f (history is pdt-stamped, so no prediction lead to undo)" % [
 				frame_id, lookup_usec, POSE_LOOKUP_TRIM_MS])
 
-	# Head pose at the frame's capture time, sampled at ARRIVAL. The lookup is history-based, so
-	# sampling here or after the detection gives the same pose -- but sampled here it can travel
+	# Head pose at the frame's capture time, sampled at ARRIVAL. Either way the lookup is by TIME,
+	# so sampling here or after the detection gives the same pose -- but sampled here it can travel
 	# with the frame, and the C++ side applies it together with the lens pose (markers come back
 	# in world space).
-	var cam_xform := _head_pose_at(lookup_usec)
+	var cam_xform := Transform3D.IDENTITY
+	var pose_source := "history"
+	if use_xr_locate_space and _head_locator != null:
+		# Sensor timestamp -> XrTime. Both clock offsets are resampled together (see
+		# _resample_clock_offsets), so on the Quest passthrough feed -- monotonic, the same clock
+		# XrTime runs on -- the two cancel and timestamp_ns goes in untouched; only a "realtime"
+		# feed actually needs the detour through Godot's clock. The trim applies here too, for the
+		# same residual it covers on the history path.
+		var xr_time_ns := timestamp_ns - _cam_clock_offset_ns + _xr_clock_offset_ns \
+				- int(POSE_LOOKUP_TRIM_MS * 1.0e6)
+		var loc: Dictionary = _head_locator.locate_head(xr_time_ns)
+		if loc.get("valid", false):
+			cam_xform = _play_space_to_world(loc["transform"])
+			# valid but not tracked = the runtime extrapolated through a tracking loss. Still the
+			# best answer available, so it is used -- just labelled, so a bad stretch is visible
+			# in the trace instead of silently looking like a good one.
+			pose_source = "xrLocateSpace" if loc.get("tracked", false) else "xrLocateSpace_untracked"
+		else:
+			_locate_fallback_count += 1
+	if pose_source == "history":
+		cam_xform = _head_pose_at(lookup_usec)
 	if traced:
-		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (4) head pose at capture: pos=%v (travels with the frame)" % [
-				frame_id, cam_xform.origin])
+		print("[opencv_aruco] [main_3d::_on_android_camera_frame] flow #%d (4) head pose at capture: pos=%v source=%s locate_fallbacks=%d (travels with the frame)" % [
+				frame_id, cam_xform.origin, pose_source, _locate_fallback_count])
 
 	if debug_prints_enabled and (_cam_frame_count == 1 or _cam_frame_count % 300 == 0):
 		print("[opencv_aruco] [main_3d::_on_android_camera_frame] frame: count=%d width=%d height=%d lag_ms=%.1f clock=%s fallbacks=%d" % [
@@ -582,13 +655,14 @@ func _process(_delta: float) -> void:
 	# The camera's sensor timestamp is mapped onto Godot ticks with the same monotonic offset
 	# (see _resample_clock_offsets), so an error in that offset cancels here instead of biasing.
 	var now_usec := Time.get_ticks_usec()
-	var pdt := 0
+	# Read once per frame and shared with the locate check further down, which needs the same pdt
+	# to compare against the same head pose. _xr_api is null exactly when there is no OpenXR, so
+	# this never touches a dead singleton.
+	var pdt := _xr_api.get_predicted_display_time() if _xr_api != null else 0
 	var pose_usec := now_usec + _xr_lead_usec    # desktop: lead stays 0 -> stamped with "now"
-	if _xr_stamp_poses:
-		pdt = _xr_api.get_predicted_display_time()
-		if pdt != 0:
-			pose_usec = (pdt - _xr_clock_offset_ns) / 1000
-			_xr_lead_usec = pose_usec - now_usec
+	if _xr_stamp_poses and pdt != 0:
+		pose_usec = (pdt - _xr_clock_offset_ns) / 1000
+		_xr_lead_usec = pose_usec - now_usec
 	_xr_cam_pose_history.append([pose_usec, xr_camera.global_transform])
 	# Pruned against the NEWEST stamp rather than now_usec: the entries sit in the future once
 	# they are pdt-stamped, and measuring the window from "now" would silently shorten it.
@@ -648,6 +722,15 @@ func _process(_delta: float) -> void:
 			_pdt_advance_ns = 0
 			_pdt_wall_advance_usec = 0
 			_lead_sum_ms = 0.0
+
+	# Device validation for the xrLocateSpace switch. Its own timer and its own condition, NOT
+	# folded into the pdt block above: this is what decides whether use_xr_locate_space may be
+	# turned on, so it has to keep working on a deploy where the pdt stamping is off.
+	if debug_prints_enabled and _head_locator != null:
+		_locate_check_timer += _delta
+		if _locate_check_timer >= 1.0:
+			_locate_check_timer = 0.0
+			_check_xr_locate(pdt)
 
 	# (a) Collect the latest finished detection and bake it into the scene (main thread ->
 	# scene-tree writes are safe here); also re-fills the task slot from the pending frame.
@@ -876,6 +959,105 @@ func _head_pose_at(t_usec: int) -> Transform3D:
 			var p1: Transform3D = _xr_cam_pose_history[i + 1][1]
 			return p0.interpolate_with(p1, w)
 	return _xr_cam_pose_history[0][1]
+
+
+# OpenXR play space -> world. The locator returns the head relative to the PLAY space, which is
+# what XROrigin3D stands for -- but XRCamera3D's own transform additionally carries XRServer's
+# reference frame (whatever center_on_hmd() last set) and the world scale. Reapplying both here is
+# what makes check (A) below a test of the TIME argument rather than of this conversion; with an
+# untouched XROrigin3D, no recentering and world_scale 1 all three factors are identity, so this
+# costs nothing today and stops the poses drifting off the moment locomotion or scaling appears.
+func _play_space_to_world(head: Transform3D) -> Transform3D:
+	var scaled := Transform3D(head.basis, head.origin * XRServer.world_scale)
+	return xr_origin.global_transform * XRServer.get_reference_frame() * scaled
+
+
+# One probe: head pose at xr_time, expressed in world space and compared against `live`. Returns
+# the two scalars the checks below print, or just valid=false if the runtime would not answer.
+# Factored out because the whole point of the check is comparing the SAME measurement at three
+# different times -- doing that inline three times invites the three copies drifting apart.
+func _locate_delta(xr_time: int, live: Transform3D) -> Dictionary:
+	var loc: Dictionary = _head_locator.locate_head(xr_time)
+	if not loc.get("valid", false):
+		return {"valid": false, "result": loc["result"], "flags": loc["flags"]}
+	var raw: Transform3D = loc["transform"]
+	var pose := _play_space_to_world(raw)
+	return {
+		"valid": true,
+		"tracked": loc["tracked"],
+		"flags": loc["flags"],
+		"pos_mm": pose.origin.distance_to(live.origin) * 1000.0,
+		"rot_deg": rad_to_deg(pose.basis.get_rotation_quaternion().angle_to(live.basis.get_rotation_quaternion())),
+		# The play-space pose exactly as the runtime gave it, before any conversion -- see the
+		# raw diagnostic line below.
+		"ps_origin": raw.origin,
+	}
+
+
+# Once-a-second device check for the xrLocateSpace path (debug prints only). MOVE YOUR HEAD while
+# reading it -- every number below is a difference between two head poses, so standing still makes
+# all of them zero and proves nothing.
+#
+#   (A) Which instant does XRCamera3D's pose actually describe, and does our conversion reproduce
+#       it? Probed at BOTH times OpenXR offers -- get_predicted_display_time() and
+#       get_next_frame_time() (= pdt + one display period) -- because Godot could plausibly use
+#       either: it samples the head pose in the main loop, and whether that happens before or
+#       after the frame's xrWaitFrame decides which one is current. Whichever comes back at ~0 is
+#       the one XRCamera3D belongs to; the other sits a display period of head motion away.
+#       MEASURED ON DEVICE: pdt wins, by a wide margin -- it reproduces XRCamera3D to 0.02-0.3mm
+#       (often bit-for-bit) while one display period is worth ~7mm at normal head speed. So the
+#       pdt-stamped history carries NO one-frame stagger, and that suspicion can come off
+#       POSE_LOOKUP_TRIM_MS's list; what is left for it is start-vs-middle of exposure.
+#       If NEITHER probe is near zero, the VIEW space or _play_space_to_world is wrong and
+#       nothing else here means anything until that is fixed.
+#   (B) Does this runtime answer for times in the PAST? That is the entire premise of the switch:
+#       a camera frame is 30-60ms old by the time it arrives. valid=true at
+#       pdt - LOCATE_PAST_PROBE_MS says yes, and pos_mm/rot_deg then show how far the head
+#       travelled over that interval -- which is exactly the error the history path has to cover
+#       with predicted poses. MEASURED: valid, tracked, and 1-31mm of movement over the 60ms.
+#       valid=false would mean the runtime will not serve history: turn use_xr_locate_space off.
+func _check_xr_locate(pdt: int) -> void:
+	if pdt == 0:
+		print("[opencv_aruco] [main_3d::_check_xr_locate] openxr locate check: no predicted display time yet")
+		return
+	if not _head_locator.is_ready():
+		print("[opencv_aruco] [main_3d::_check_xr_locate] openxr locate check: locator not ready (no session or play space yet)")
+		return
+
+	# Read once, so all three probes are compared against the same reference pose.
+	var live := xr_camera.global_transform
+	var next_time: int = _xr_api.get_next_frame_time()
+
+	var at_pdt := _locate_delta(pdt, live)
+	var at_next := _locate_delta(next_time, live)
+	print("[opencv_aruco] [main_3d::_check_xr_locate] openxr locate check (A) vs XRCamera3D: pdt=%s next_frame=%s gap_ms=%.2f (MOVE YOUR HEAD; the one at ~0 is the time XRCamera3D's pose belongs to)" % [
+			_fmt_locate(at_pdt), _fmt_locate(at_next), (next_time - pdt) / 1.0e6])
+
+	var in_past := _locate_delta(pdt - int(LOCATE_PAST_PROBE_MS * 1.0e6), live)
+	print("[opencv_aruco] [main_3d::_check_xr_locate] openxr locate check (B) at pdt-%.0fms: %s (valid => historical queries work, and the offsets are the motion over that interval)" % [
+			LOCATE_PAST_PROBE_MS, _fmt_locate(in_past)])
+
+	# Raw values, because the two lines above only ever show DIFFERENCES -- and a difference of
+	# "head height" looks the same whether the located pose is wrong or simply absent (which is
+	# exactly how the transform_from_pose() bug first presented).
+	#   ps == cam_local            -> the pose and the whole conversion are right
+	#   ps=(0,0,0) with valid=true -> the runtime did not write our XrSpaceLocation
+	# ps_move is the premise in one number: the play-space origin at pdt against the one 60ms
+	# earlier. Exactly 0.00 while your head is moving would mean the runtime ignores `time` and
+	# the switch is worthless; measured here it runs 1-31mm, i.e. historical queries work.
+	if at_pdt["valid"] and in_past["valid"]:
+		print("[opencv_aruco] [main_3d::_check_xr_locate] openxr locate raw: ps=%v cam_local=%v cam_world=%v origin=%v ref=%v scale=%.2f ps_move_mm=%.2f" % [
+				at_pdt["ps_origin"],
+				xr_camera.transform.origin, live.origin,
+				xr_origin.global_transform.origin, XRServer.get_reference_frame().origin,
+				XRServer.world_scale,
+				at_pdt["ps_origin"].distance_to(in_past["ps_origin"]) * 1000.0])
+
+
+func _fmt_locate(d: Dictionary) -> String:
+	if not d["valid"]:
+		return "INVALID(result=%d flags=%d)" % [d["result"], d["flags"]]
+	return "[pos_mm=%.2f rot_deg=%.3f tracked=%s]" % [d["pos_mm"], d["rot_deg"], d["tracked"]]
 
 
 
