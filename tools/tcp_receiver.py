@@ -9,6 +9,16 @@ os.makedirs(save_dir, exist_ok=True)
 WIDTH = 1280
 HEIGHT = 1280
 
+# Per-frame logging. Leave off while streaming: a print per frame on a Windows console blocks
+# long enough to hold the loop below under the sender's frame rate, and every frame this loop is
+# late is a frame the Quest has to drop.
+VERBOSE = False
+
+
+def log(*a):
+    if VERBOSE:
+        print(*a)
+
 #have to create a tcp connection on socket 7007
 #adb reverse tcp:7007 tcp:7007
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -31,34 +41,34 @@ def recvall(sock, size):
 image_num=0
 
 while True:
-    print("waiting for 16-byte header...")
+    log("waiting for 16-byte header...")
     header = recvall(comm_socket, 16)
 
     if header is None:
         print("header is None / connection closed")
         break
 
-    print("got header bytes:", len(header), header)
+    log("got header bytes:", len(header), header)
 
     width = int.from_bytes(header[0:4], "big")
     height = int.from_bytes(header[4:8], "big")
     fmt = int.from_bytes(header[8:12], "big")
     size = int.from_bytes(header[12:16], "big")
 
-    print("parsed header:", width, height, fmt, size)
+    log("parsed header:", width, height, fmt, size)
 
     if width <= 0 or height <= 0 or size <= 0 or size > 50_000_000:
         print("invalid header, stopping")
         break
 
-    print("waiting for payload:", size)
+    log("waiting for payload:", size)
     data = recvall(comm_socket, size)
 
     if data is None:
         print("payload is None / connection closed")
         break
 
-    print("got payload:", len(data))
+    log("got payload:", len(data))
 
     arr = np.frombuffer(data, dtype=np.uint8)
 
@@ -71,10 +81,12 @@ while True:
         print("unsupported format:", fmt)
         continue
 
-    print("showing frame")
+    log("showing frame")
     cv2.imshow("Quest Feed", img)
 
-    k = cv2.waitKey(100) & 0xFF
+    # 1 ms, not 100: waitKey is the loop's only pause, so waitKey(100) caps this receiver at ~10
+    # frames per second no matter how fast the Quest sends. 'q' and 's' still register.
+    k = cv2.waitKey(1) & 0xFF
 
     if k  == ord('q'):
         break

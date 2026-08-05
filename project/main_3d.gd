@@ -233,6 +233,18 @@ var _last_tcp_status := -1
 var _tcp_send_timer := 0.0
 const TCP_SEND_INTERVAL := 0.01
 
+# Outbound frame buffer for the debug streamer. StreamPeerTCP.put_data() BLOCKS until the last
+# byte is gone, so calling it from the main thread hands our frame budget to the receiver: as soon
+# as the Python script or the adb tunnel falls behind, TCP back-pressure stalls _process, the
+# OpenXR frame submission stops with it and the runtime kills the app. So a frame is buffered here
+# instead and drained with put_partial_data() from _poll_tcp, which never blocks. A frame arriving
+# while the previous one is still draining is DROPPED (not queued) -- that caps the lag at one
+# frame and makes the stream self-limit to whatever rate the link and the receiver can really take.
+# Dropping is per whole frame on purpose: a half-sent frame cannot be replaced without desyncing
+# the receiver's header/payload framing.
+var _tcp_out := PackedByteArray()
+var _tcp_dropped := 0
+
 #######################################################################################################
 
 # --- Public marker API -------------------------------------------------------------------------
@@ -1070,6 +1082,8 @@ func _exit_tree() -> void:
 		WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 		_detect_task_id = -1
 
+# Buffers one frame for the debug streamer and pushes what fits right now. Never blocks; drops the
+# frame outright while the previous one is still on its way out (see _tcp_out).
 func _send_frame_tcp(img: Image) -> void:
 	if stream_peer == null:
 		return
@@ -1079,16 +1093,53 @@ func _send_frame_tcp(img: Image) -> void:
 	if stream_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
 		return
 
+	if not _tcp_out.is_empty():
+		_tcp_dropped += 1
+		if debug_prints_enabled and _tcp_dropped % 100 == 0:
+			print("[opencv_aruco] [main_3d::_send_frame_tcp] receiver behind: dropped=%d backlog=%d bytes" % [
+					_tcp_dropped, _tcp_out.size()])
+		return
+
 	var bytes: PackedByteArray = img.get_data()
 
-	stream_peer.put_u32(img.get_width())
-	stream_peer.put_u32(img.get_height())
-	stream_peer.put_u32(img.get_format())
-	stream_peer.put_u32(bytes.size())
+	# 16-byte header, big-endian: width, height, Image.Format, payload size (tools/tcp_receiver.py).
+	# Written by hand rather than via put_u32 because header and payload have to reach the buffer as
+	# one block -- a partially written header would desync the receiver for good.
+	var frame := PackedByteArray()
+	frame.append_array(_be_u32(img.get_width()))
+	frame.append_array(_be_u32(img.get_height()))
+	frame.append_array(_be_u32(img.get_format()))
+	frame.append_array(_be_u32(bytes.size()))
+	frame.append_array(bytes)
 
-	var err := stream_peer.put_data(bytes)
+	_tcp_out = frame
+	_flush_tcp()
+
+
+func _be_u32(value: int) -> PackedByteArray:
+	return PackedByteArray([
+			(value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+
+
+# Hands the socket as much of the buffered frame as it will take without waiting. Called once per
+# _process from _poll_tcp and again right after buffering, so a frame that fits leaves the same frame.
+func _flush_tcp() -> void:
+	if _tcp_out.is_empty() or stream_peer == null:
+		return
+
+	var res: Array = stream_peer.put_partial_data(_tcp_out)
+	var err: int = res[0]
+	var sent: int = res[1]
+
 	if err != OK:
-		push_error("[opencv_aruco] [main_3d::_send_frame_tcp] put_data failed: err=%d" % err)
+		push_error("[opencv_aruco] [main_3d::_flush_tcp] put_partial_data failed: err=%d" % err)
+		_tcp_out.clear()
+		return
+
+	if sent >= _tcp_out.size():
+		_tcp_out.clear()
+	elif sent > 0:
+		_tcp_out = _tcp_out.slice(sent)
 
 func _connect_tcp() -> void:
 	stream_peer = StreamPeerTCP.new()
@@ -1115,12 +1166,15 @@ func _poll_tcp(delta: float) -> void:
 
 	if status == StreamPeerTCP.STATUS_CONNECTED:
 		_tcp_reconnect_timer = 0.0
+		_flush_tcp()
 		return
 
 	if status == StreamPeerTCP.STATUS_CONNECTING:
 		return
 
 	if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
+		# The half-sent frame belongs to the dead socket; a reconnect starts at a header boundary.
+		_tcp_out.clear()
 		_tcp_reconnect_timer += delta
 		if _tcp_reconnect_timer >= 1.0:
 			_tcp_reconnect_timer = 0.0
