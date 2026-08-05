@@ -68,14 +68,23 @@ var _patch_mesh := BoxMesh.new()
 # --- Camera calibration (left Quest passthrough camera "50", native 640x480 frame) ---
 # Exported so they can be tuned in the inspector instead of hunting through code. Read-only
 # after _ready: detection tasks read them without a lock (same pattern as _marker_size_table),
-# so treat inspector edits as pre-run configuration, not live tuning.
+# so treat inspector edits as pre-run configuration, not live tuning. Careful with that: the
+# inspector's default float step is 0.001 and neither export below carries a range hint, so
+# EDITING a distortion coefficient there rounds it to 3 decimals -- which zeroes both tangential
+# terms outright. Change these in the file, not in the spinboxes.
 # Intrinsics (fx, fy, cx, cy) in pixels for the NATIVE 640x480 frame. _detect_frame scales all
 # four with the downscale factor at use time -- never bake that factor into these values.
-# (approximations: cx ~ width/2, cy ~ height/2)
-@export var camera_intrinsics := Vector4(435.37335635, 435.96983202, 320.84589009, 241.55014114)
+# Calibrated with tools/cameraCalibration.py from TCP-streamed frames captured through the
+# GodotAndroidCamera (CameraX) path, i.e. the pipeline that actually runs. That provenance is the
+# point: the previous set came from the CameraServer readback path and agreed with this one to
+# 1.5px and 0.2% on the focal lengths, which is what ruled out CameraX picking a different sensor
+# crop -- a different field of view would have moved fx by percent, not by 0.08%. A calibration is
+# only valid for the capture path that produced its images, so RE-SHOOT these after any change to
+# the resolution, the output format, or the camera backend.
+@export var camera_intrinsics := Vector4(435.01136927, 435.03491996, 321.81974795, 240.07772099)
 # OpenCV distCoeffs (k1, k2, p1, p2, k3) for the Quest passthrough lens; an EMPTY array means
 # "no distortion". These used to be hardcoded in the C++ side.
-@export var camera_distortion: PackedFloat64Array = [-0.00484306, 0.14036606, 0.00044449, -0.00108918, -0.29608385]
+@export var camera_distortion: PackedFloat64Array = [-0.00993192, 0.11168738, 0.00062258, 0.00113467, -0.23033717]
 # Detection resolution knob: 1.0 = native frame, 0.5 = half width AND half height, i.e. a quarter
 # of the pixels -> markedly cheaper detection, at the price of small or distant markers dropping
 # below the resolution the detector needs. _detect_frame hands it to the C++ side AND scales the
