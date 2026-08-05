@@ -91,19 +91,69 @@ var _patch_mesh := BoxMesh.new()
 # intrinsics above by the same factor; the two must always move together, which is why the factor
 # belongs here and never baked into camera_intrinsics.
 @export_range(0.1, 1.0, 0.05) var image_downscale_factor := 1.0
-# Physical passthrough-camera pose relative to the gyro/IMU reference, RAW from the Quest's
-# ACAMERA_LENS_POSE_ROTATION / _TRANSLATION (LENS_POSE_REFERENCE == GYROSCOPE).
-# The raw quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg X-flip
-# PLUS the camera's real ~11deg pitch. The C++ marker pose already contains that same 180deg
-# flip (its negate-Y/Z change of basis), so _ready multiplies by Quaternion(1,0,0,0) (=180deg
-# about X) to cancel the flip and keep ONLY the physical mounting tilt (-> _lens_pose).
-# The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
-# camera axes -> raw values, no sign flips. If markers land in the wrong place, the axis
-# convention is the knob: try the conjugate quaternion / flipped translation signs.
-@export var lens_rotation_raw := Quaternion(-0.99518352746964, 0.0030334177427, -0.00252024177462, 0.09795006364584)
-@export var lens_translation := Vector3(-0.03238632902503, -0.01766911894083, -0.06318981945515)
+# Passthrough camera expressed in the OpenXR VIEW frame -- MEASURED, not read off the device.
+# Stored in the Quest's raw ACAMERA_LENS_POSE_* convention only because _ready decodes that
+# convention: the raw quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg
+# X-flip PLUS the camera's real ~11deg pitch, and since the C++ marker pose already contains that
+# same 180deg flip (its negate-Y/Z change of basis), _ready multiplies by Quaternion(1,0,0,0)
+# (=180deg about X) to cancel it and keep ONLY the physical mounting tilt (-> _lens_pose).
+# Translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot camera
+# axes -> no sign flips.
+# These two are ONE calibration and must be replaced as a pair -- a rotation from one solve beside
+# a translation from another describes no camera that exists.
+#
+# DO NOT "fix" these by pasting in what init_quest_intrinsics() logs at startup, however
+# authoritative that dump looks. It is gyro-referenced: LENS_POSE_REFERENCE == GYROSCOPE means the
+# metadata describes the camera relative to the IMU, while cam_to_world applies it to the VIEW
+# pose. Those frames differ by the IMU's mounting rotation, which NEITHER api exposes -- OpenXR
+# has no IMU reference space, Camera2 never mentions the view -- so the difference cannot be
+# looked up and has to be measured. Running the raw dump is what produced a ~11mm offset that no
+# pose-path change could touch (present with the head completely still, on both the history and
+# the xrLocateSpace path) while still swinging the patch around as the head turned, the error
+# being conjugated by the head transform.
+#
+# Solved by tools/handeye_solve.py from 439 captured samples (see handeye_capture above):
+# H_i * L * M_i collapses to one world pose to 2.4mm median / 6.1mm p90, against 3.7mm/7.3mm for
+# the previous hand-carried dump. Re-measure with that tool rather than editing by eye.
+# Note what the same solve says about ORIENTATION: the marker's world rotation still scatters
+# 7.7deg median / 14.5deg p90, and that is NOT calibration error -- it is solvePnP's inherent
+# noise on a single small planar marker at ~0.7m, and it stays no matter how good this pose is.
+# A patch that sits in the right place but visibly wobbles in orientation is that, and the fix is
+# temporal averaging or a multi-marker board, not another lens-pose hunt.
+@export var lens_rotation_raw := Quaternion(-0.99501617258316, -0.00309562040391, 0.00819784967978, 0.09932788477010)
+@export var lens_translation := Vector3(-0.03126009993300, -0.01277714405469, -0.06316742365001)
 # Derived ONCE from the exported raw values in _ready (before any detection task can exist).
 var _lens_pose := Transform3D.IDENTITY
+
+# --- Hand-eye calibration capture (measures T_view->cam directly, all six DOF) ---
+# A measurement run, not a thing to leave on. Everything above sources _lens_pose from Camera2's
+# LENS_POSE_*, which is referenced to the GYROSCOPE, while cam_to_world applies it to the OpenXR
+# VIEW pose. The T_view->gyro factor between those frames is unmodelled -- it is not a number any
+# API hands out (OpenXR has no IMU reference space, Camera2 never mentions the view), so no
+# amount of editing the raw dump converges on it. This collects the raw material for solving it
+# instead: for a STATIONARY marker, H_i * L * M_i must be the SAME world pose for every
+# observation, so L = T_view->cam falls out of enough (H_i, M_i) pairs. That is the classic
+# AX = XB hand-eye problem.
+# M_i costs nothing to obtain: the C++ returns W = (cam_xform * _lens_pose) * M_cam, so
+# M_cam = (cam_xform * _lens_pose).affine_inverse() * W recovers the camera-space pose exactly.
+# No second detection pass, no extra ~40ms on the frame, and the live path is untouched -- the
+# capture reads the result that was going to be produced anyway.
+@export var handeye_capture := false
+# Samples are kept only when the head has MOVED since the last one. AX = XB is solved from the
+# RELATIVE motion between observations, so a thousand samples taken while holding still carry no
+# information whatsoever -- they only weight the fit toward whichever pose was held longest. The
+# rotation threshold matters more than the translation one: pure translation leaves the rotational
+# part of L unconstrained, which is exactly the part we are chasing.
+const HANDEYE_MIN_ROT_DEG := 2.0
+const HANDEYE_MIN_POS_M := 0.02
+# Enough for a well-conditioned solve many times over; the cap only stops an unattended run from
+# filling the headset's storage.
+const HANDEYE_MAX_SAMPLES := 500
+const HANDEYE_PATH := "user://handeye_samples.jsonl"
+var _handeye_file: FileAccess
+var _handeye_kept := 0                          # frames written, not lines (a frame can see several)
+var _handeye_last_xform := Transform3D.IDENTITY
+var _handeye_has_last := false
 
 
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
@@ -869,9 +919,74 @@ func _get_or_create_patch(id: int) -> Node3D:
 # Apply the finished detection (main thread only). The markers come back from the C++ side
 # already in WORLD space -- baked with the head pose at the frame's capture time, which
 # travelled with the frame -- so applying is a plain assignment.
+# Row-major 3x4 [R | t], so numpy reshapes it straight into a pose matrix. Godot's Basis stores
+# its x/y/z as COLUMNS (basis.x == get_column(0) == the image of the local X axis), so the rows
+# written here are built component-wise rather than by dumping basis.x/y/z in order -- doing that
+# would silently transpose every rotation and the solve would converge on nonsense.
+func _xform_to_array(t: Transform3D) -> Array:
+	return [
+		t.basis.x.x, t.basis.y.x, t.basis.z.x, t.origin.x,
+		t.basis.x.y, t.basis.y.y, t.basis.z.y, t.origin.y,
+		t.basis.x.z, t.basis.y.z, t.basis.z.z, t.origin.z,
+	]
+
+
+# One JSONL line per (frame, marker): the head pose in WORLD space and that marker's pose in RAW
+# CAMERA space. Main thread only, called from _apply_detection_result -- the worker never touches
+# any of this.
+# Two things invalidate a capture run, and neither is detectable from the data afterwards:
+# the marker must not MOVE (the whole constraint is that its world pose is constant), and the
+# reference frame must not shift under you -- no XRServer.center_on_hmd(), no moving XROrigin3D,
+# since the head poses are logged in world space.
+func _handeye_record(head: Transform3D, markers: Dictionary) -> void:
+	if markers.is_empty() or _handeye_kept >= HANDEYE_MAX_SAMPLES:
+		return
+	if _handeye_has_last:
+		var moved_deg := rad_to_deg(head.basis.get_rotation_quaternion().angle_to(
+				_handeye_last_xform.basis.get_rotation_quaternion()))
+		var moved_m := head.origin.distance_to(_handeye_last_xform.origin)
+		if moved_deg < HANDEYE_MIN_ROT_DEG and moved_m < HANDEYE_MIN_POS_M:
+			return
+	# Opened lazily, on the first kept sample: with the flag off this function costs one bool test
+	# per detection and never touches the filesystem.
+	if _handeye_file == null:
+		_handeye_file = FileAccess.open(HANDEYE_PATH, FileAccess.WRITE)
+		if _handeye_file == null:
+			push_error("[opencv_aruco] [main_3d::_handeye_record] cannot open %s: err=%d (capture disabled)" % [
+					HANDEYE_PATH, FileAccess.get_open_error()])
+			handeye_capture = false
+			return
+		print("[opencv_aruco] [main_3d::_handeye_record] handeye capture started: path=%s" % ProjectSettings.globalize_path(HANDEYE_PATH))
+	# Exactly the pose the C++ pre-multiplied onto every solvePnP result, so inverting it undoes
+	# that one step and nothing else -- what comes back is the raw camera-space marker pose,
+	# independent of whatever _lens_pose currently holds. That independence is the point: the
+	# samples stay valid even if the lens pose is edited between capture and solve.
+	var inv := (head * _lens_pose).affine_inverse()
+	for id in markers:
+		_handeye_file.store_line(JSON.stringify({
+			"id": id,
+			"head": _xform_to_array(head),
+			"marker_cam": _xform_to_array(inv * markers[id]),
+		}))
+	# Flushed per sample because a Quest session ends with `adb shell am force-stop`, which gives
+	# the app no chance to close anything -- an unflushed buffer would take the run with it.
+	_handeye_file.flush()
+	_handeye_kept += 1
+	_handeye_last_xform = head
+	_handeye_has_last = true
+	if _handeye_kept % 25 == 0:
+		print("[opencv_aruco] [main_3d::_handeye_record] handeye samples=%d/%d (vary head pitch AND yaw; rotation is what constrains the solve)" % [
+				_handeye_kept, HANDEYE_MAX_SAMPLES])
+
+
 func _apply_detection_result() -> void:
 	var markers: Dictionary = _result_markers
 	var result_id: int = _result_frame_id
+	if handeye_capture:
+		# _result_cam_xform is the head pose the markers were actually baked with, i.e. the pose at
+		# CAPTURE time rather than the live one -- the same pairing the live path uses, so a
+		# calibration solved from these samples is valid for it.
+		_handeye_record(_result_cam_xform, markers)
 	if _tracing(result_id):
 		print("[opencv_aruco] [main_3d::_apply_detection_result] flow #%d (8) applying result: capture_usec=%d result_age_ms=%.1f markers=%d" % [
 				result_id, _result_capture_usec,
@@ -1090,6 +1205,14 @@ func _exit_tree() -> void:
 	if _detect_task_id != -1:
 		WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 		_detect_task_id = -1
+	# Closed AFTER the task drain above, so a detection finishing during teardown cannot write into
+	# a closed handle. Every sample is already flushed, so this only tidies up on a clean exit --
+	# a force-stop skips it and loses nothing.
+	if _handeye_file != null:
+		_handeye_file.close()
+		_handeye_file = null
+		print("[opencv_aruco] [main_3d::_exit_tree] handeye capture closed: samples=%d path=%s" % [
+				_handeye_kept, ProjectSettings.globalize_path(HANDEYE_PATH)])
 
 # Buffers one frame for the debug streamer and pushes what fits right now. Never blocks; drops the
 # frame outright while the previous one is still on its way out (see _tcp_out).
