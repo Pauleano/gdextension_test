@@ -1,4 +1,4 @@
-extends XROrigin3D
+extends Node
 
 # Minimal OpenXR startup: find the interface, initialise it, and switch the
 # viewport to XR. Works on both desktop (no headset -> flat fallback) and Quest.

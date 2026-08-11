@@ -1,0 +1,33 @@
+[gd_scene format=3 uid="uid://catn06b43r1ce"]
+
+[ext_resource type="Script" uid="uid://df20bwxeyvlj4" path="res://xr_startup.gd" id="1_2fw1a"]
+[ext_resource type="Script" uid="uid://71itkcthmqh2" path="res://open_cv_processor.gd" id="2_nwih5"]
+
+[node name="XROrigin3D" type="XROrigin3D" unique_id=1743576496]
+
+[node name="XRCamera3D" type="XRCamera3D" parent="." unique_id=1388799716]
+
+[node name="OpenXRMetaEnvironmentDepth" type="OpenXRMetaEnvironmentDepth" parent="XRCamera3D" unique_id=104270219]
+
+[node name="XRStartup" type="Node" parent="." unique_id=790114788]
+script = ExtResource("1_2fw1a")
+
+[node name="OpenCVProcessor" type="OpenCVProcessor" parent="." unique_id=1900282744]
+aruco_patch_sizes = PackedFloat64Array(0.065, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
+script = ExtResource("2_nwih5")
+use_xr_locate_space = false
+
+[node name="Patches" type="Node3D" parent="." unique_id=1900282745]
+
+[node name="CameraLayer" type="CanvasLayer" parent="." unique_id=206553118]
+
+[node name="CameraPreview" type="TextureRect" parent="CameraLayer" unique_id=1073749614]
+custom_minimum_size = Vector2(320, 240)
+offset_right = 320.0
+offset_bottom = 240.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1064034995]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1)

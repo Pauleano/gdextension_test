@@ -3,6 +3,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <opencv2/opencv.hpp> //solvepnp should be inside of calib3d module which is inside opencv
 #include <godot_cpp/classes/project_settings.hpp> //to convert path starting from res: to global path
+#include <godot_cpp/classes/engine.hpp> //is_editor_hint(): der Knoten liegt in der Szene, der Editor baut ihn mit
 #include <algorithm> //std::clamp for the downscale parameter
 //#include <godot_cpp/variant/transform3d.hpp> wird momentan nicht benötigt, da es von wo anders anscheinend schon reingezogen wird
 //#include <opencv2/objdetect/aruco_detector.hpp> falls error "incomplete type" auftauchen sollten 
@@ -21,7 +22,7 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 //Das feste Praefix macht sie in logcat greifbar (adb logcat | grep opencv_aruco), wo sie sonst
 //zwischen Engine- und OpenXR-Ausgaben untergehen. __func__ statt handgeschriebenem Namen, damit
 //die Angabe beim Umbenennen nicht veraltet.
-//ACV_DBG haengt am debug_prints_enabled-Flag (aus GDScript, siehe main_3d.gd); die Argumente werden
+//ACV_DBG haengt am debug_prints_enabled-Flag (aus GDScript, siehe open_cv_processor.gd); die Argumente werden
 //nur ausgewertet, wenn das Flag gesetzt ist -- wichtig fuer die Ausgaben im Detektions-Pfad.
 //ACV_ERR ist NICHT abschaltbar: echte Fehler sollen auch ohne Debug-Flag im Log stehen.
 #define ACV_DBG(...) \
@@ -32,20 +33,151 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_sizes", "default_marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
-    //statisch gebunden, damit es vor new() aufrufbar ist (der Konstruktor gibt selbst schon aus)
+    ClassDB::bind_method(D_METHOD("detect_markers", "image", "head_pose"), &OpenCVProcessor::detect_markers);
+    ClassDB::bind_method(D_METHOD("get_marker_size", "id"), &OpenCVProcessor::get_marker_size);
+    ClassDB::bind_method(D_METHOD("get_lens_pose"), &OpenCVProcessor::get_lens_pose);
+    //statisch gebunden, damit GDScript es setzen kann, BEVOR initialize() laeuft -- der Knoten
+    //selbst wird schon beim Instanziieren der Szene gebaut, also lange vor jedem Property und
+    //jedem _ready (siehe initialize()).
     ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("set_debug_prints_enabled", "enabled"), &OpenCVProcessor::set_debug_prints_enabled);
+    ClassDB::bind_method(D_METHOD("initialize"), &OpenCVProcessor::initialize);
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
+
+    // ---- Kalibrierungs-Properties (frueher @export im GDScript) ----
+    // Jede Property bekommt einen EXPLIZITEN Range-Hint, allein wegen der Schrittweite: ohne Hint
+    // rastet der Inspector auf 0.001, und ein dort editierter Verzeichnungskoeffizient wird auf drei
+    // Nachkommastellen gerundet -- was beide tangentialen Terme glatt auf null setzt. Die
+    // Schrittweite, nicht der Wertebereich, ist hier der Punkt; "or_greater"/"or_less" heben die
+    // Grenzen wieder auf, "hide_slider" laesst nur das Zahlenfeld stehen.
+    ClassDB::bind_method(D_METHOD("set_camera_intrinsics", "value"), &OpenCVProcessor::set_camera_intrinsics);
+    ClassDB::bind_method(D_METHOD("get_camera_intrinsics"), &OpenCVProcessor::get_camera_intrinsics);
+    ADD_PROPERTY(PropertyInfo(Variant::VECTOR4, "camera_intrinsics", PROPERTY_HINT_RANGE,
+                     "0,2000,0.00001,or_greater,hide_slider"),
+            "set_camera_intrinsics", "get_camera_intrinsics");
+
+    ClassDB::bind_method(D_METHOD("set_camera_distortion", "value"), &OpenCVProcessor::set_camera_distortion);
+    ClassDB::bind_method(D_METHOD("get_camera_distortion"), &OpenCVProcessor::get_camera_distortion);
+    // Bei Array-Properties traegt der Elementtyp den Hint: "<Typ>/<Hint>:<Hint-String>" -- dieselbe
+    // Kodierung, die @export_range auf einem Array[float] erzeugt.
+    ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT64_ARRAY, "camera_distortion", PROPERTY_HINT_TYPE_STRING,
+                     String::num_int64(Variant::FLOAT) + "/" + String::num_int64(PROPERTY_HINT_RANGE) +
+                             ":-1,1,0.00000001,or_greater,or_less,hide_slider"),
+            "set_camera_distortion", "get_camera_distortion");
+
+    ClassDB::bind_method(D_METHOD("set_image_downscale_factor", "value"), &OpenCVProcessor::set_image_downscale_factor);
+    ClassDB::bind_method(D_METHOD("get_image_downscale_factor"), &OpenCVProcessor::get_image_downscale_factor);
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "image_downscale_factor", PROPERTY_HINT_RANGE, "0.1,1.0,0.05"),
+            "set_image_downscale_factor", "get_image_downscale_factor");
+
+    ClassDB::bind_method(D_METHOD("set_lens_rotation_raw", "value"), &OpenCVProcessor::set_lens_rotation_raw);
+    ClassDB::bind_method(D_METHOD("get_lens_rotation_raw"), &OpenCVProcessor::get_lens_rotation_raw);
+    ADD_PROPERTY(PropertyInfo(Variant::QUATERNION, "lens_rotation_raw", PROPERTY_HINT_RANGE,
+                     "-1,1,0.00000001,or_greater,or_less,hide_slider"),
+            "set_lens_rotation_raw", "get_lens_rotation_raw");
+
+    ClassDB::bind_method(D_METHOD("set_lens_translation", "value"), &OpenCVProcessor::set_lens_translation);
+    ClassDB::bind_method(D_METHOD("get_lens_translation"), &OpenCVProcessor::get_lens_translation);
+    ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "lens_translation", PROPERTY_HINT_RANGE,
+                     "-1,1,0.00000001,or_greater,or_less,hide_slider,suffix:m"),
+            "set_lens_translation", "get_lens_translation");
+
+    ClassDB::bind_method(D_METHOD("set_aruco_patch_size", "value"), &OpenCVProcessor::set_aruco_patch_size);
+    ClassDB::bind_method(D_METHOD("get_aruco_patch_size"), &OpenCVProcessor::get_aruco_patch_size);
+    ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "aruco_patch_size", PROPERTY_HINT_RANGE,
+                     "0.01,0.3,0.000001,or_greater,suffix:m"),
+            "set_aruco_patch_size", "get_aruco_patch_size");
+
+    ClassDB::bind_method(D_METHOD("set_aruco_patch_sizes", "value"), &OpenCVProcessor::set_aruco_patch_sizes);
+    ClassDB::bind_method(D_METHOD("get_aruco_patch_sizes"), &OpenCVProcessor::get_aruco_patch_sizes);
+    ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT64_ARRAY, "aruco_patch_sizes", PROPERTY_HINT_TYPE_STRING,
+                     String::num_int64(Variant::FLOAT) + "/" + String::num_int64(PROPERTY_HINT_RANGE) +
+                             ":0.01,0.3,0.000001,or_greater,suffix:m"),
+            "set_aruco_patch_sizes", "get_aruco_patch_sizes");
+}
+
+// ================================ Kalibrierung: Zugriff + Ableitung ================================
+// Die Setter bauen die abgeleiteten Groessen SOFORT neu. Genau das war vorher nicht so: das GDScript
+// hat die Linsenpose einmal in _ready gerechnet, also blieb eine Korrektur im Remote-Inspector eines
+// laufenden Deploys wirkungslos, bis die App neu startete.
+
+void OpenCVProcessor::rebuild_distortion() {
+    // Spalten-Mat in CV_32F, passend zur Kameramatrix. Ein leeres Array laesst distort_mat leer --
+    // das ist gueltig und heisst fuer solvePnP "keine Verzeichnung".
+    const int n = (int)camera_distortion.size();
+    if (n <= 0) {
+        distort_mat = cv::Mat();
+        return;
+    }
+    distort_mat = cv::Mat(n, 1, CV_32F);
+    const double *dp = camera_distortion.ptr();
+    for (int j = 0; j < n; ++j) {
+        distort_mat.at<float>(j) = (float)dp[j];
+    }
+}
+
+void OpenCVProcessor::rebuild_lens_pose() {
+    // Siehe die ausfuehrliche Herleitung an lens_rotation_raw im Header: die Multiplikation mit
+    // Quaternion(1,0,0,0) (=180deg um X) hebt genau den Flip auf, den detect_and_solve_all beim
+    // Basiswechsel OpenCV->Godot schon eingebaut hat, und laesst nur die physische Neigung stehen.
+    lens_pose = Transform3D(Basis((lens_rotation_raw * Quaternion(1, 0, 0, 0)).inverse()), lens_translation);
+}
+
+void OpenCVProcessor::set_camera_intrinsics(const Vector4 &p_value) { camera_intrinsics = p_value; }
+Vector4 OpenCVProcessor::get_camera_intrinsics() const { return camera_intrinsics; }
+
+void OpenCVProcessor::set_camera_distortion(const PackedFloat64Array &p_value) {
+    camera_distortion = p_value;
+    rebuild_distortion();
+}
+PackedFloat64Array OpenCVProcessor::get_camera_distortion() const { return camera_distortion; }
+
+void OpenCVProcessor::set_image_downscale_factor(float p_value) { image_downscale_factor = p_value; }
+float OpenCVProcessor::get_image_downscale_factor() const { return image_downscale_factor; }
+
+void OpenCVProcessor::set_lens_rotation_raw(const Quaternion &p_value) {
+    lens_rotation_raw = p_value;
+    rebuild_lens_pose();
+}
+Quaternion OpenCVProcessor::get_lens_rotation_raw() const { return lens_rotation_raw; }
+
+void OpenCVProcessor::set_lens_translation(const Vector3 &p_value) {
+    lens_translation = p_value;
+    rebuild_lens_pose();
+}
+Vector3 OpenCVProcessor::get_lens_translation() const { return lens_translation; }
+
+void OpenCVProcessor::set_aruco_patch_size(float p_value) { aruco_patch_size = p_value; }
+float OpenCVProcessor::get_aruco_patch_size() const { return aruco_patch_size; }
+
+void OpenCVProcessor::set_aruco_patch_sizes(const PackedFloat64Array &p_value) { aruco_patch_sizes = p_value; }
+PackedFloat64Array OpenCVProcessor::get_aruco_patch_sizes() const { return aruco_patch_sizes; }
+
+Transform3D OpenCVProcessor::get_lens_pose() const { return lens_pose; }
+
+//Nicht-positive Eintraege zaehlen als "kein Eintrag", damit eine kaputte Tabellenzeile solvePnP nie
+//ein entartetes Quadrat unterschiebt -- und damit eine 0 im Inspector schlicht "unbelegt" heisst.
+float OpenCVProcessor::get_marker_size(int id) const {
+    if (id >= 0 && id < (int)aruco_patch_sizes.size()) {
+        const double s = aruco_patch_sizes[id];
+        if (s > 0.0) {
+            return (float)s;
+        }
+    }
+    return aruco_patch_size;
 }
 
 void OpenCVProcessor::set_debug_prints_enabled(bool p_enabled) {
     debug_prints_enabled = p_enabled;
 }
 
+//Der Konstruktor MUSS still bleiben. Seit die Klasse ein in der Szene angelegter Knoten ist (statt
+//per OpenCVProcessor.new() aus _ready erzeugt), laeuft er beim Instanziieren der Szene: PackedScene
+//baut den Knoten und setzt ERST DANACH die Properties, und ueber uns haengt kein Skript mehr, das
+//das Flag frueher setzen koennte. Alles, was ausgibt oder auf Geraete zugreift, steht darum in
+//initialize() -- das GDScript eine Zeile nach set_debug_prints_enabled() aufruft.
+//Der Detektor selbst bleibt hier: er gibt nichts aus und muss vor dem ersten Aufruf stehen.
 OpenCVProcessor::OpenCVProcessor() {
-
-    ACV_DBG("opencv build information:\n", String(cv::getBuildInformation().c_str())); // Full build configuration.
 
     //ArucoNano replaces cv::aruco::ArucoDetector: same detectMarkers signature, but its own
     //"visited aware" contour tracer plus direct sub-pixel sampling. There is no
@@ -66,9 +198,48 @@ OpenCVProcessor::OpenCVProcessor() {
     detector = std::make_unique<aruco_nano::ArucoDetector>(
         std::vector<cv::aruco::Dictionary>{ cv::aruco::getPredefinedDictionary(cv::aruco::DICT_ARUCO_MIP_36h12) });
 
-    init_quest_intrinsics();
+    //Defaults der Packed-Arrays: die haben keinen Inline-Initialisierer im Header. Godot liest die
+    //Property-Defaults, indem es die Klasse einmal instanziiert -- was hier steht, ist also genau
+    //das, was der Inspector als "unveraendert" ansieht.
+    camera_distortion = PackedFloat64Array();
+    camera_distortion.push_back(-0.00993192);
+    camera_distortion.push_back(0.11168738);
+    camera_distortion.push_back(0.00062258);
+    camera_distortion.push_back(0.00113467);
+    camera_distortion.push_back(-0.23033717);
+    aruco_patch_sizes = PackedFloat64Array();
+    for (int i = 0; i < 10; ++i) {
+        aruco_patch_sizes.push_back(0.05);
+    }
+
+    //Die abgeleiteten Groessen einmal aufbauen, damit sie auch dann stimmen, wenn die Szene die
+    //Properties gar nicht ueberschreibt (dann laeuft kein Setter).
+    rebuild_distortion();
+    rebuild_lens_pose();
 }
 OpenCVProcessor::~OpenCVProcessor() {}
+
+//Der redselige Teil des frueheren Konstruktors, aus GDScript aufgerufen, NACHDEM
+//set_debug_prints_enabled() gelaufen ist -- nur so laesst sich der Build-Info-Dump ueberhaupt noch
+//abschalten (siehe Konstruktor). Idempotent, damit ein zweiter Aufruf (Szene neu geladen, Skript
+//umgebaut) nicht ein zweites Mal die Kamera-Metadaten liest.
+void OpenCVProcessor::initialize() {
+    //Im Editor nur zurueckhalten: die Szene enthaelt den Knoten, also baut der Editor ihn bei jedem
+    //Oeffnen mit. Der Build-Info-Dump gehoert nicht ins Editor-Ausgabefenster, und die Quest-
+    //Kameras gibt es auf dem Entwicklungsrechner ohnehin nicht. VOR dem initialized-Flag, damit ein
+    //Abbruch im Editor den einmaligen Lauf nicht verbraucht.
+    if (Engine::get_singleton()->is_editor_hint()) {
+        return;
+    }
+    if (initialized) {
+        return;
+    }
+    initialized = true;
+
+    ACV_DBG("opencv build information:\n", String(cv::getBuildInformation().c_str())); // Full build configuration.
+
+    init_quest_intrinsics();
+}
 
 
 void OpenCVProcessor::init_quest_intrinsics() {
@@ -265,30 +436,30 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
     return result;
 }
 
-//shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). marker_sizes is the
-//per-id ground-truth table (id -> side length in m); ids without an entry use default_marker_size.
-//same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
-//as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dictionary &marker_sizes, float default_marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose) {
+//shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). Everything it needs beyond
+//the pixels and the head pose is a property (see the header): per-id marker sizes, intrinsics,
+//distortion, downscale, lens pose. Same OpenCV->Godot change of basis as the picture/webcam
+//variants above.
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose) {
     Dictionary result;
 
-    // Rigid pose pre-multiplied onto every marker, supplied by GDScript. solvePnP returns the
-    // marker pose in the physical CAMERA frame; GDScript passes head_pose_at_capture_time *
-    // lens_pose (the Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION offset), so both
-    // transforms that hold for ALL markers are applied in one place and the returned poses are
-    // already WORLD space. An identity Transform3D makes this a no-op and yields raw
-    // camera-space poses instead.
+    // The two transforms that hold for EVERY marker, combined once: solvePnP returns the marker
+    // pose in the physical CAMERA frame, head_pose is where the head was when the shutter opened
+    // (only the caller can know that), and lens_pose is the fixed camera-to-head offset. So the
+    // returned poses are already WORLD space and the caller has nothing left to apply. An identity
+    // head_pose makes this the lens pose alone and yields near-camera-space poses.
     // NOTE: if markers land in the wrong place, the axis convention between the Android lens pose
-    // and Godot is the knob -- try the conjugate quaternion / flipped translation signs (easiest to
-    // do where the lens pose is constructed in GDScript).
+    // and Godot is the knob -- try the conjugate quaternion / flipped translation signs on
+    // lens_rotation_raw / lens_translation.
+    const Transform3D cam_to_world = head_pose * lens_pose;
 
     double tick_freq = cv::getTickFrequency();
 
     // Downscale before detection: the adaptive-threshold + contour stage scales with pixel count,
     // so 0.5 = ~4x fewer pixels. The fake intrinsics (fx=fy=width) scale with the image too, so the
     // metric pose stays correct; only corner localisation gets coarser. Pass 1.0f to disable.
-    // Clamp to a sane range so a bad value from GDScript can't blow up cv::resize.
-    const float DETECT_DOWNSCALE = std::clamp(downscale, 0.05f, 1.0f);
+    // Clamp to a sane range so a bad value from the inspector can't blow up cv::resize.
+    const float DETECT_DOWNSCALE = std::clamp(image_downscale_factor, 0.05f, 1.0f);
     int64_t t_resize = cv::getTickCount();
     cv::Mat det_frame;
     if (DETECT_DOWNSCALE != 1.0f) {
@@ -303,6 +474,16 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
     float w = static_cast<float>(det_frame.cols);
     float h = static_cast<float>(det_frame.rows);
     ACV_DBG("detect frame: width=", w, " height=", h);
+
+    // camera_intrinsics is calibrated for the NATIVE frame, so all four components scale with the
+    // image -- and with the CLAMPED factor used for the resize above, not the raw property, so the
+    // two can never disagree. (GDScript used to scale them with the unclamped value and hand the
+    // result in; an out-of-range factor silently produced a camera matrix for a frame size that was
+    // never rendered.)
+    const float fx = (float)camera_intrinsics.x * DETECT_DOWNSCALE;
+    const float fy = (float)camera_intrinsics.y * DETECT_DOWNSCALE;
+    const float cx = (float)camera_intrinsics.z * DETECT_DOWNSCALE;
+    const float cy = (float)camera_intrinsics.w * DETECT_DOWNSCALE;
 
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         fx, 0, cx,
@@ -335,14 +516,9 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
 
     double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
-        // Per-id physical size: table entry from GDScript (double Variant) if present, else the
-        // global fallback. Non-positive values count as "no entry" so a bad table row can never
-        // hand solvePnP a degenerate square. GDScript int keys match ids[i] (int Variant) exactly.
-        double msize = (double)marker_sizes.get(ids[i], default_marker_size);
-        if (!(msize > 0.0)) {
-            msize = default_marker_size;
-        }
-        const float half = (float)msize / 2.0f;
+        // Per-id physical size, through the SAME function the GDScript uses to scale the rendered
+        // patch -- so the pose's metric scale and the box drawn over the marker cannot disagree.
+        const float half = get_marker_size(ids[i]) / 2.0f;
         const std::vector<cv::Point3f> obj_pts = {
             {-half,  half, 0.0f},
             { half,  half, 0.0f},
@@ -352,7 +528,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
         cv::Mat rvec, tvec;
         int64_t t_solve = cv::getTickCount();
         bool ok2 = cv::solvePnP(
-            obj_pts, corners[i], Kamera_matrix, distort,
+            obj_pts, corners[i], Kamera_matrix, distort_mat,
             rvec, tvec,
             false,
             cv::SOLVEPNP_IPPE_SQUARE);
@@ -376,15 +552,17 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
             (-tvec.at<double>(2))
         );
 
-        result[ids[i]] = lens_pose * Transform3D(basis, origin);
+        result[ids[i]] = cam_to_world * Transform3D(basis, origin);
     }
 
     ACV_DBG("solvepnp_ms=", solve_ms, " markers=", (int)ids.size());
     return result;
 }
 
-//is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const Dictionary &marker_sizes, const float &default_marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose) {
+//is given a frame the caller already owns (CameraX plugin on Quest, CameraServer on desktop) plus
+//the head pose at that frame's capture time -- the one input that changes per frame and that only
+//the caller can know. Everything else is a property.
+Dictionary OpenCVProcessor::detect_markers(const Ref<Image> &image, const Transform3D &head_pose) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -424,25 +602,10 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         cv::cvtColor(rgb, gray, cv::COLOR_RGB2GRAY);
     }
 
-    // Unpack the packed Godot inputs: intrinsics = (fx, fy, cx, cy); distortion = OpenCV distCoeffs.
-    float fx = (float)intrinsics.x;
-    float fy = (float)intrinsics.y;
-    float cx = (float)intrinsics.z;
-    float cy = (float)intrinsics.w;
-
-    // Copy the distortion vector into a column Mat (CV_32F, to match the camera matrix). An empty
-    // array leaves `distort` empty, which solvePnP treats as zero distortion.
-    cv::Mat distort;
-    int dist_n = (int)distortion.size();
-    if (dist_n > 0) {
-        distort = cv::Mat(dist_n, 1, CV_32F);
-        const double *dp = distortion.ptr();
-        for (int j = 0; j < dist_n; ++j) {
-            distort.at<float>(j) = (float)dp[j];
-        }
-    }
-
-    return detect_and_solve_all(gray, marker_sizes, default_marker_size, downscale, fx, fy, cx, cy, distort, lens_pose);
+    // Intrinsics, distortion, marker sizes and the lens pose all come from the properties now --
+    // the distortion Mat in particular is built once in its setter instead of being rebuilt out of
+    // a PackedFloat64Array on every single frame.
+    return detect_and_solve_all(gray, head_pose);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {

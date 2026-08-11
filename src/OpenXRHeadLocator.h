@@ -69,7 +69,7 @@ public:
 
 	//Head pose at p_xr_time, expressed in Godot's OpenXR PLAY space -- NOT world space. The
 	//caller still has to apply XROrigin3D's transform, XRServer.get_reference_frame() and the
-	//world scale to get where XRCamera3D would be (see _play_space_to_world in main_3d.gd).
+	//world scale to get where XRCamera3D would be (see _play_space_to_world in open_cv_processor.gd).
 	//
 	//p_xr_time is a raw XrTime in nanoseconds: on the Quest that is CLOCK_MONOTONIC, the same
 	//clock the passthrough camera stamps its frames with, so a frame's sensor timestamp can go

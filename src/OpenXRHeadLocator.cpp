@@ -35,7 +35,7 @@ OpenXRHeadLocator::OpenXRHeadLocator() {}
 OpenXRHeadLocator::~OpenXRHeadLocator() {
 	//Belt and braces only: by scene-tree teardown the session is usually already gone, and
 	//release() notices that and skips xrDestroySpace instead of calling it on a dead handle.
-	//The real cleanup path is the session_stopping signal (see main_3d.gd).
+	//The real cleanup path is the session_stopping signal (see open_cv_processor.gd).
 	release();
 }
 
