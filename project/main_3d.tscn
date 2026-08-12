@@ -5,7 +5,8 @@
 
 [node name="main3d" type="Node3D" unique_id=327546220]
 script = ExtResource("1_wiwsh")
-aruco_patch_sizes = Array[float]([0.05, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
+aruco_patch_sizes = Array[float]([0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
+debug_prints_enabled = true
 
 [node name="XROrigin3D" type="XROrigin3D" parent="." unique_id=1743576496]
 script = ExtResource("2_xr")

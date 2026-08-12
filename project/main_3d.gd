@@ -86,8 +86,8 @@ var _patch_mesh := BoxMesh.new()
 # The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
 # camera axes -> raw values, no sign flips. If markers land in the wrong place, the axis
 # convention is the knob: try the conjugate quaternion / flipped translation signs.
-@export var lens_rotation_raw := Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866)
-@export var lens_translation := Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378)
+@export var lens_rotation_raw := Quaternion(-0.99513953924179, 0.0030371833127, -0.00251883361489, 0.0983956977725)
+@export var lens_translation := Vector3(-0.03214744105935, -0.01810946315527, -0.06306969374418)
 # Derived ONCE from the exported raw values in _ready (before any detection task can exist).
 var _lens_pose := Transform3D.IDENTITY
 
@@ -110,9 +110,12 @@ var cam_texture: CameraTexture
 # There is no pending-frame slot on this branch: frames are PULLED here, so instead of parking a
 # frame while the worker is busy we simply do not read one back (see _process).
 var _detect_task_id := -1              # WorkerThreadPool task id; -1 = no task in flight
-# output slot, written by the task; the main thread reads it only AFTER
+# output slots, written by the task; the main thread reads them only AFTER
 # wait_for_task_completion(), which is the synchronization point (no lock needed)
 var _result_markers: Dictionary = {}
+# id -> PackedVector2Array of the 4 marker corners in the frame's own pixel space, straight from
+# the C++ detector. Debug data for the TCP overlay ONLY -- the poses above are what the app runs on.
+var _result_corners: Dictionary = {}
 
 # --- Capture-latency compensation ---
 # The Image get_image() returns is OLDER than "now": sensor -> ISP -> CameraServer texture takes
@@ -137,6 +140,10 @@ var _tcp_reconnect_timer := 0.0
 var _last_tcp_status := -1
 var _tcp_send_timer := 0.0
 const TCP_SEND_INTERVAL := 0.01
+# The frame the in-flight (or just finished) detection task is working on, kept so the streamer can
+# send it TOGETHER with that detection's corners -- the corners only exist once the worker is done,
+# so a frame sent at readback time could never carry them. Overwritten on every dispatch.
+var _stream_img: Image
 
 #######################################################################################################
 # --- Public marker API -------------------------------------------------------------------------
@@ -355,6 +362,9 @@ func _on_camera_feeds_updated() -> void:
 
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
+	# Ticked here rather than in the readback branch below: the debug frame is now sent from
+	# _poll_detection_task, which the early returns further down never reach.
+	_tcp_send_timer += _delta
 
 	# (a) Sample the head pose EVERY render frame, before any early return below: _head_pose_at
 	# interpolates between the two nearest samples, so its accuracy is bounded by the sampling
@@ -398,12 +408,6 @@ func _process(_delta: float) -> void:
 	if debug_prints_enabled:
 		print("[opencv_aruco] [main_3d::_process] readback_ms=%.2f image_format=%d" % [(Time.get_ticks_usec() - readback_t0) / 1000.0, img.get_format()])
 
-	_tcp_send_timer += _delta
-	if _tcp_send_timer >= TCP_SEND_INTERVAL:
-		_tcp_send_timer = 0.0
-		if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
-			_send_frame_tcp(img)
-
 	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~CAMERA_LATENCY_MS old
 	# (passthrough pipeline), so look that far back in the history filled in (a). The pose travels
 	# with the frame and the C++ side applies it together with the lens pose, so the markers come
@@ -420,8 +424,14 @@ func _poll_detection_task() -> void:
 	WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 	_detect_task_id = -1
 	_apply_detection_result()
+	# Only now do the frame and its corners both exist, so this is the earliest point at which the
+	# overlay can be streamed as one consistent pair.
+	_stream_detected_frame()
 
 func _start_detection_task(img: Image, cam_xform: Transform3D) -> void:
+	# Held for the debug streamer: _poll_detection_task sends THIS frame once the task below has
+	# produced the corners that belong to it.
+	_stream_img = img
 	_detect_task_id = WorkerThreadPool.add_task(_detect_frame.bind(img, cam_xform),
 			false, "opencv_aruco marker detection")
 
@@ -507,7 +517,12 @@ func _detect_frame(img: Image, cam_xform: Transform3D) -> void:
 	# lens offset -- combined into ONE camera->world pose. The C++ side pre-multiplies it onto
 	# each solvePnP pose, so the returned Dictionary is already in WORLD space.
 	var cam_to_world := cam_xform * _lens_pose
-	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, _marker_size_table, aruco_patch_size, image_downscale_factor, intrinsics, camera_distortion, cam_to_world)
+	# Out-parameter for the debug overlay: Dictionaries are shared references in Godot, so the C++
+	# side writes the detected pixel corners into THIS instance. Built fresh per detection (rather
+	# than clearing _result_corners) so the main thread can never see a half-filled dictionary --
+	# the slot is only re-pointed at the end, past the same barrier as _result_markers.
+	var corners: Dictionary = {}
+	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, _marker_size_table, aruco_patch_size, image_downscale_factor, intrinsics, camera_distortion, cam_to_world, corners)
 	# Guarded inline rather than via a helper function: a helper would build this string on every
 	# detection (~12x/s on the Quest) before it could check the flag.
 	if debug_prints_enabled:
@@ -516,6 +531,7 @@ func _detect_frame(img: Image, cam_xform: Transform3D) -> void:
 		print("[opencv_aruco] [main_3d::_detect_frame] detect_ms=%.1f tracking_fps=%.1f render_fps=%d markers=%d" % [
 				detect_ms, tracking_fps, Engine.get_frames_per_second(), markers.size()])
 	_result_markers = markers
+	_result_corners = corners
 
 
 # Head pose at t_usec, interpolated between the two nearest history samples (the raw history has
@@ -547,7 +563,26 @@ func _exit_tree() -> void:
 		WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 		_detect_task_id = -1
 
-func _send_frame_tcp(img: Image) -> void:
+# Send the last detected frame plus its corners, at most every TCP_SEND_INTERVAL. Called from
+# _poll_detection_task, i.e. once per finished detection (~12/s on Quest) rather than once per
+# render frame -- the interval only throttles further, it can no longer force a send.
+func _stream_detected_frame() -> void:
+	if _stream_img == null:
+		return
+	if _tcp_send_timer < TCP_SEND_INTERVAL:
+		return
+	_tcp_send_timer = 0.0
+	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
+		_send_frame_tcp(_stream_img, _result_corners)
+
+# Wire format, big-endian throughout (stream_peer.big_endian), consumed by tools/tcp_receiver.py:
+#   header:  width u32, height u32, image_format u32, payload_size u32      (16 bytes)
+#   payload: payload_size raw Image bytes
+#   markers: marker_count u32, then per marker id u32 + 8 f32               (36 bytes each)
+#            = the 4 corners as x0,y0,x1,y1,x2,y2,x3,y3 in the payload's own pixel space.
+# The marker block is APPENDED after the image so the original 16-byte header stayed as it was.
+# Corner count per marker is fixed at 4 (guaranteed by the C++ side), hence no per-marker length.
+func _send_frame_tcp(img: Image, corners: Dictionary) -> void:
 	if stream_peer == null:
 		return
 
@@ -565,7 +600,18 @@ func _send_frame_tcp(img: Image) -> void:
 
 	var err := stream_peer.put_data(bytes)
 	if err != OK:
+		# Bail out before the marker block: the receiver is reading a fixed number of bytes per
+		# frame, so appending to a truncated payload would desync every following frame too.
 		push_error("[opencv_aruco] [main_3d::_send_frame_tcp] put_data failed: err=%d" % err)
+		return
+
+	stream_peer.put_u32(corners.size())
+	for id in corners:
+		stream_peer.put_u32(id)
+		var pts: PackedVector2Array = corners[id]
+		for p in pts:
+			stream_peer.put_float(p.x)
+			stream_peer.put_float(p.y)
 
 func _connect_tcp() -> void:
 	stream_peer = StreamPeerTCP.new()

@@ -31,7 +31,7 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_sizes", "default_marker_size", "downscale", "intrinsics", "distortion", "lens_pose"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
+    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_godot_image", "image", "marker_sizes", "default_marker_size", "downscale", "intrinsics", "distortion", "lens_pose", "corners_out"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image);
     //statisch gebunden, damit es vor new() aufrufbar ist (der Konstruktor gibt selbst schon aus)
     ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("set_debug_prints_enabled", "enabled"), &OpenCVProcessor::set_debug_prints_enabled);
 
@@ -257,7 +257,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //per-id ground-truth table (id -> side length in m); ids without an entry use default_marker_size.
 //same approximate intrinsics (fx=fy=width, no distortion) and OpenCV->Godot change of basis
 //as the picture/webcam variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dictionary &marker_sizes, float default_marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dictionary &marker_sizes, float default_marker_size, float downscale,const float &fx, const float &fy,const float &cx,const float &cy,const cv::Mat &distort,const Transform3D &lens_pose, Dictionary &corners_out) {
     Dictionary result;
 
     // Rigid pose pre-multiplied onto every marker, supplied by GDScript. solvePnP returns the
@@ -321,6 +321,22 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
         return result;
     }
 
+    // Pixel corners of everything detectMarkers found, handed back for the debug TCP overlay
+    // (tools/tcp_receiver.py feeds them to cv2.aruco.drawDetectedMarkers on the laptop, so the
+    // stream shows the borders THIS detector saw instead of a second, independent detection).
+    // Divided by DETECT_DOWNSCALE, i.e. mapped back out of the detection frame into the ORIGINAL
+    // frame's pixel space -- that is the image the streamer sends, and it carries no downscale.
+    // Filled BEFORE the solve loop and for every detected marker, including any whose solvePnP
+    // fails below: the overlay is meant to show what the detector saw, not what survived the pose
+    // solve. Two markers sharing an id collapse into one entry, exactly as they do in `result`.
+    for (size_t i = 0; i < ids.size(); ++i) {
+        PackedVector2Array pts;
+        for (int c = 0; c < 4; ++c) {
+            pts.push_back(Vector2(corners[i][c].x / DETECT_DOWNSCALE, corners[i][c].y / DETECT_DOWNSCALE));
+        }
+        corners_out[ids[i]] = pts;
+    }
+
     double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
         // Per-id physical size: table entry from GDScript (double Variant) if present, else the
@@ -372,7 +388,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
 }
 
 //is given a frame the Godot CameraServer/CameraFeed already owns ()
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const Dictionary &marker_sizes, const float &default_marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose) {
+Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const Ref<Image> &image, const Dictionary &marker_sizes, const float &default_marker_size, const float &downscale, const Vector4 &intrinsics, const PackedFloat64Array &distortion, const Transform3D &lens_pose, Dictionary corners_out) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -430,7 +446,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_godot_image(const
         }
     }
 
-    return detect_and_solve_all(gray, marker_sizes, default_marker_size, downscale, fx, fy, cx, cy, distort, lens_pose);
+    return detect_and_solve_all(gray, marker_sizes, default_marker_size, downscale, fx, fy, cx, cy, distort, lens_pose, corners_out);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {
