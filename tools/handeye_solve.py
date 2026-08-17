@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Solve the camera->view transform (T_view_cam) from samples written by main_3d.gd's
+# Solve the camera->view transform (T_view_cam) from samples written by open_cv_processor.gd's
 # handeye_capture. Only numpy is needed -- no cv2, no scipy.
 #
 # Why this exists: _lens_pose has to be the passthrough camera expressed in the OpenXR VIEW
@@ -349,20 +349,24 @@ def main():
     print("  right place -- averaging over frames or using a multi-marker board is the fix for")
     print("  that, not a better lens pose.")
 
-    # main_3d.gd does not take T_view_cam directly: _ready derives _lens_pose from the two
-    # exported values as Transform3D(Basis((lens_rotation_raw * Q180X).inverse()), lens_translation),
-    # with Q180X = Quaternion(1,0,0,0). Inverting that gives lens_rotation_raw = R_L^-1 * Q180X^-1,
-    # so the literals below drop straight into the script with no code change.
+    # Nothing takes T_view_cam directly: the two values below are properties of the OpenCVProcessor
+    # node, and rebuild_lens_pose() (src/OpenCVProcessor.cpp) derives lens_pose from them as
+    # Transform3D(Basis((lens_rotation_raw * Q180X).inverse()), lens_translation), with
+    # Q180X = Quaternion(1,0,0,0). Inverting that gives lens_rotation_raw = R_L^-1 * Q180X^-1,
+    # so the literals below drop straight in with no code change.
     q_l = mat_to_quat(l[:3, :3])
     q_l_inv = np.array([-q_l[0], -q_l[1], -q_l[2], q_l[3]])
     raw = quat_mul(q_l_inv, np.array([-1.0, 0.0, 0.0, 0.0]))
     if raw[3] < 0:
         raw = -raw          # same rotation, and matches the sign convention of the dumped values
-    print("\n--- paste into project/main_3d.gd ---")
-    print("@export var lens_rotation_raw := Quaternion(%.14f, %.14f, %.14f, %.14f)"
+    print("\n--- paste onto the OpenCVProcessor node (project/aruco_markers.tscn, or its Inspector) ---")
+    print("lens_rotation_raw = Quaternion(%.14f, %.14f, %.14f, %.14f)"
           % (raw[0], raw[1], raw[2], raw[3]))
-    print("@export var lens_translation := Vector3(%.14f, %.14f, %.14f)"
+    print("lens_translation = Vector3(%.14f, %.14f, %.14f)"
           % (l[0, 3], l[1, 3], l[2, 3]))
+    print("\n  The setters rebuild lens_pose immediately, so these can go straight into the REMOTE")
+    print("  inspector of a running deploy and take effect on the next frame -- no rebuild, no")
+    print("  re-export. The compiled-in fallbacks are the initialisers in src/OpenCVProcessor.h.")
     return 0
 
 

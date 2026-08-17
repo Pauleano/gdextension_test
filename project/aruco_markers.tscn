@@ -13,9 +13,12 @@
 script = ExtResource("1_2fw1a")
 
 [node name="OpenCVProcessor" type="OpenCVProcessor" parent="." unique_id=1900282744]
-aruco_patch_sizes = PackedFloat64Array(0.065, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
+lens_rotation_raw = Quaternion(-0.9951163, -0.0028897487, 0.0037281485, 0.098596975)
+lens_translation = Vector3(-0.03352603, -0.017866991, -0.058882877)
+aruco_patch_sizes = PackedFloat64Array(0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
 script = ExtResource("2_nwih5")
 use_xr_locate_space = false
+tcp_stream_enabled = true
 
 [node name="Patches" type="Node3D" parent="." unique_id=1900282745]
 

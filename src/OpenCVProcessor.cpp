@@ -33,9 +33,10 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 void OpenCVProcessor::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
     ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
-    ClassDB::bind_method(D_METHOD("detect_markers", "image", "head_pose"), &OpenCVProcessor::detect_markers);
+    ClassDB::bind_method(D_METHOD("detect_markers", "image", "head_pose", "corners_out"), &OpenCVProcessor::detect_markers);
     ClassDB::bind_method(D_METHOD("get_marker_size", "id"), &OpenCVProcessor::get_marker_size);
     ClassDB::bind_method(D_METHOD("get_lens_pose"), &OpenCVProcessor::get_lens_pose);
+    ClassDB::bind_method(D_METHOD("project_marker_corners", "world_poses", "head_pose"), &OpenCVProcessor::project_marker_corners);
     //statisch gebunden, damit GDScript es setzen kann, BEVOR initialize() laeuft -- der Knoten
     //selbst wird schon beim Instanziieren der Szene gebaut, also lange vor jedem Property und
     //jedem _ready (siehe initialize()).
@@ -440,7 +441,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 //the pixels and the head pose is a property (see the header): per-id marker sizes, intrinsics,
 //distortion, downscale, lens pose. Same OpenCV->Godot change of basis as the picture/webcam
 //variants above.
-Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose) {
+Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose, Dictionary &corners_out) {
     Dictionary result;
 
     // The two transforms that hold for EVERY marker, combined once: solvePnP returns the marker
@@ -514,6 +515,22 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
         return result;
     }
 
+    // Pixel corners of everything detectMarkers found, handed back for the debug TCP overlay
+    // (tools/tcp_receiver.py feeds them to cv2.aruco.drawDetectedMarkers on the laptop, so the
+    // stream shows the borders THIS detector saw instead of a second, independent detection).
+    // Divided by DETECT_DOWNSCALE, i.e. mapped back out of the detection frame into the ORIGINAL
+    // frame's pixel space -- that is the image the streamer sends, and it carries no downscale.
+    // Filled BEFORE the solve loop and for every detected marker, including any whose solvePnP
+    // fails below: the overlay is meant to show what the detector saw, not what survived the pose
+    // solve. Two markers sharing an id collapse into one entry, exactly as they do in `result`.
+    for (size_t i = 0; i < ids.size(); ++i) {
+        PackedVector2Array pts;
+        for (int c = 0; c < 4; ++c) {
+            pts.push_back(Vector2(corners[i][c].x / DETECT_DOWNSCALE, corners[i][c].y / DETECT_DOWNSCALE));
+        }
+        corners_out[ids[i]] = pts;
+    }
+
     double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
         // Per-id physical size, through the SAME function the GDScript uses to scale the rendered
@@ -559,10 +576,85 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
     return result;
 }
 
+//Debug-Overlay: projiziert WELT-Posen zurueck ins Pixelbild, durch dieselben Intrinsics, dieselbe
+//Verzeichnung und dieselbe lens_pose wie die Detektion.
+//
+//Only useful ACROSS frames. Reprojecting the poses that came out of THIS frame with THIS frame's
+//head pose cancels exactly -- detect_and_solve_all multiplied by head_pose * lens_pose and this
+//divides by it again, so the square would land on the marker no matter how wrong lens_pose is.
+//Fed the PREVIOUS frame's poses instead, it isolates lens_pose and the head-pose timing in PIXELS:
+//a wrong lens pose makes a marker's world pose depend on the head pose it was solved at, so the
+//drawn square walks off the marker as the head turns between the two frames. That is the AX = XB
+//residual made visible, with passthrough reprojection and the eye projection out of the loop --
+//which is what the naked-eye comparison in the headset cannot separate.
+Dictionary OpenCVProcessor::project_marker_corners(Dictionary world_poses, const Transform3D &head_pose) const {
+    Dictionary out;
+    if (world_poses.is_empty()) {
+        return out;
+    }
+
+    //NATIVE-Frame-Intrinsics, bewusst NICHT mit image_downscale_factor skaliert: der Downscale
+    //existiert nur, um die Detektion billiger zu machen. Diese Pixel werden gegen die Ecken
+    //verglichen, die detect_and_solve_all oben schon wieder aus dem Detektionsframe herausgeteilt
+    //hat -- beide leben also im Pixelraum des ORIGINALBILDS, das der Streamer verschickt.
+    cv::Mat K = (cv::Mat_<double>(3, 3) <<
+        camera_intrinsics.x, 0.0, camera_intrinsics.z,
+        0.0, camera_intrinsics.y, camera_intrinsics.w,
+        0.0, 0.0, 1.0);
+
+    const Transform3D world_to_cam = (head_pose * lens_pose).affine_inverse();
+
+    const Array ids = world_poses.keys();
+    for (int i = 0; i < ids.size(); ++i) {
+        const int id = (int)ids[i];
+        const Transform3D cam_pose = world_to_cam * (Transform3D)world_poses[ids[i]];
+
+        //Macht den OpenCV->Godot-Basiswechsel rueckgaengig, der in jeder zurueckgegebenen Pose
+        //steckt: F = diag(1, -1, -1), also T_cv = F * T_godot * F, und F ist zu sich selbst invers.
+        //b[r][c] ist hier ZEILENweise (godot-cpp Basis haelt rows[3]), waehrend der Hinweg die Basis
+        //aus SPALTEN gebaut hat -- daher sieht das Vorzeichenmuster transponiert aus.
+        const Basis &b = cam_pose.basis;
+        cv::Mat rot = (cv::Mat_<double>(3, 3) <<
+             b[0][0], -b[0][1], -b[0][2],
+            -b[1][0],  b[1][1],  b[1][2],
+            -b[2][0],  b[2][1],  b[2][2]);
+        const Vector3 &o = cam_pose.origin;
+        cv::Mat tvec = (cv::Mat_<double>(3, 1) << (double)o.x, (double)-o.y, (double)-o.z);
+
+        //Hinter der Kamera liefert projectPoints weiterhin Zahlen -- gespiegelten Unsinn. Ein
+        //Marker, den dieser Frame gar nicht sehen kann, faellt hier raus statt als Geisterquadrat
+        //irgendwo im Bild zu landen.
+        if (tvec.at<double>(2) <= 1e-4) {
+            continue;
+        }
+
+        cv::Mat rvec;
+        cv::Rodrigues(rot, rvec);
+
+        //Dieselben Objektpunkte und dieselbe Groessenquelle wie im solvePnP oben.
+        const float half = get_marker_size(id) / 2.0f;
+        const std::vector<cv::Point3f> obj_pts = {
+            {-half,  half, 0.0f},
+            { half,  half, 0.0f},
+            { half, -half, 0.0f},
+            {-half, -half, 0.0f}
+        };
+        std::vector<cv::Point2f> img_pts;
+        cv::projectPoints(obj_pts, rvec, tvec, K, distort_mat, img_pts);
+
+        PackedVector2Array pts;
+        for (size_t c = 0; c < img_pts.size(); ++c) {
+            pts.push_back(Vector2(img_pts[c].x, img_pts[c].y));
+        }
+        out[id] = pts;
+    }
+    return out;
+}
+
 //is given a frame the caller already owns (CameraX plugin on Quest, CameraServer on desktop) plus
 //the head pose at that frame's capture time -- the one input that changes per frame and that only
 //the caller can know. Everything else is a property.
-Dictionary OpenCVProcessor::detect_markers(const Ref<Image> &image, const Transform3D &head_pose) {
+Dictionary OpenCVProcessor::detect_markers(const Ref<Image> &image, const Transform3D &head_pose, Dictionary corners_out) {
     Dictionary result;
 
     if (image.is_null() || image->is_empty()) {
@@ -605,7 +697,7 @@ Dictionary OpenCVProcessor::detect_markers(const Ref<Image> &image, const Transf
     // Intrinsics, distortion, marker sizes and the lens pose all come from the properties now --
     // the distortion Mat in particular is built once in its setter instead of being rebuilt out of
     // a PackedFloat64Array on every single frame.
-    return detect_and_solve_all(gray, head_pose);
+    return detect_and_solve_all(gray, head_pose, corners_out);
 }
 
 Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {

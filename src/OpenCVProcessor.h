@@ -4,9 +4,11 @@
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/variant/quaternion.hpp>
+#include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 #include <godot_cpp/variant/vector4.hpp>
 #include <godot_cpp/variant/packed_float64_array.hpp>
+#include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
@@ -90,16 +92,28 @@ private:
     // on both the history and the xrLocateSpace path) while still swinging the patch around as the
     // head turned, the error being conjugated by the head transform.
     //
-    // Solved by tools/handeye_solve.py from 439 captured samples (see handeye_capture in the
-    // GDScript): H_i * L * M_i collapses to one world pose to 2.4mm median / 6.1mm p90, against
-    // 3.7mm/7.3mm for the previous hand-carried dump. Re-measure with that tool rather than editing
-    // by eye. Note what the same solve says about ORIENTATION: the marker's world rotation still
-    // scatters 7.7deg median / 14.5deg p90, and that is NOT calibration error -- it is solvePnP's
-    // inherent noise on a single small planar marker at ~0.7m, and it stays no matter how good this
-    // pose is. A patch that sits in the right place but visibly wobbles in orientation is that, and
-    // the fix is temporal averaging or a multi-marker board, not another lens-pose hunt.
-    Quaternion lens_rotation_raw = Quaternion(-0.99519097805023, 0.00269138417207, 0.00294101587497, 0.09787271916866);
-    Vector3 lens_translation = Vector3(-0.03237725794315, -0.01770938560367, -0.06345107406378);
+    // Solved by tools/handeye_solve.py from 500 captured samples of marker 0 (see handeye_capture
+    // in the GDScript): H_i * L * M_i collapses to one world pose to 1.2mm median / 3.5mm p90, at a
+    // rotation-observability ratio of 2.8 -- the solve warns above ~20, where the marker stayed too
+    // central in frame for one rotation axis to be pinned down. Re-measure with that tool rather
+    // than editing by eye.
+    // CAUTION, learned the hard way: until 2026-08-12 these two literals were still the RAW
+    // gyro-referenced dump, unchanged since 2026-07-07, while this comment already described them
+    // as measured. Nothing about a wrong lens pose announces itself, and a comment claiming the
+    // calibration was done is enough to stop anyone re-checking it -- which is exactly what kept a
+    // ~0.9deg offset (15mm at 1m, 5mm at 40cm) alive across three branches and two Godot versions.
+    // What the solve changed tells the rest of the story: the ~11.2deg X pitch came back
+    // essentially untouched, and virtually the whole 0.45deg correction landed in YAW and ROLL --
+    // precisely the two components the raw quaternion cannot express, its axis being pure X to
+    // within 0.2deg. Translation moved only 4.7mm, matching the measured offset scaling with
+    // distance (a translation error would not have).
+    // Note what the same solve says about ORIENTATION: the marker's world rotation still scatters
+    // 2.2deg median / 5.2deg p90, and that is NOT calibration error -- it is solvePnP's inherent
+    // noise on a single small planar marker, and it stays no matter how good this pose is. A patch
+    // that sits in the right place but visibly wobbles in orientation is that, and the fix is
+    // temporal averaging or a multi-marker board, not another lens-pose hunt.
+    Quaternion lens_rotation_raw = Quaternion(-0.99520788537121, -0.00260202523029, 0.00286401182712, 0.09770512676372);
+    Vector3 lens_translation = Vector3(-0.03586537368457, -0.01756000674934, -0.06026289442816);
 
     // Fallback physical side length in meters for every marker id WITHOUT an aruco_patch_sizes
     // entry. Sets the pose's metric scale in solvePnP AND (through get_marker_size) the rendered
@@ -122,7 +136,9 @@ private:
     //Everything it needs beyond the pixels is a member above: per-id marker sizes, intrinsics,
     //distortion, downscale and the lens pose. head_pose is the ONLY per-frame input -- the head
     //pose at the frame's capture time, which only the caller can know.
-    Dictionary detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose);
+    //corners_out is filled with id -> PackedVector2Array of the 4 detected pixel corners (see the
+    //definition for the exact contract); it is an out-parameter, never read.
+    Dictionary detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose, Dictionary &corners_out);
 
     //for intrinsics
     cv::Mat K_cam50; //intrinsics matrix
@@ -164,7 +180,9 @@ public:
     //and returns id -> Transform3D in WORLD space: head_pose * lens_pose is pre-multiplied onto
     //every solvePnP result, so the caller has nothing left to apply. An identity head_pose yields
     //raw camera-space poses. Everything else it needs is a property above.
-    Dictionary detect_markers(const Ref<Image> &image, const Transform3D &head_pose);
+    //corners_out is an OUT-parameter: Godot Dictionaries are shared references, so the caller passes
+    //an (empty) Dictionary and gets the detected pixel corners written into its own instance.
+    Dictionary detect_markers(const Ref<Image> &image, const Transform3D &head_pose, Dictionary corners_out);
 
     //The ONE place a marker id becomes a physical size: table entry when present and positive,
     //aruco_patch_size otherwise. Bound so the GDScript can scale the rendered patch with the exact
@@ -174,6 +192,11 @@ public:
     //Read-only view of the decoded lens pose, for the hand-eye capture in the GDScript: it has to
     //invert head_pose * lens_pose to recover the camera-space marker pose from a world-space one.
     Transform3D get_lens_pose() const;
+
+    //Debug counterpart to detect_markers: projects WORLD-space marker poses back into pixel space
+    //through the same intrinsics, distortion and lens pose the detection used. Only meaningful
+    //ACROSS frames -- see the implementation for why the same-frame version cancels algebraically.
+    Dictionary project_marker_corners(Dictionary world_poses, const Transform3D &head_pose) const;
 
     void set_camera_intrinsics(const Vector4 &p_value);
     Vector4 get_camera_intrinsics() const;

@@ -185,9 +185,12 @@ var _pending_image: Image
 var _pending_capture_usec := 0
 var _pending_cam_xform := Transform3D.IDENTITY
 var _has_pending := false
-# output slot, written by the task; the main thread reads it only AFTER
+# output slots, written by the task; the main thread reads them only AFTER
 # wait_for_task_completion(), which is the synchronization point (no lock needed)
 var _result_markers: Dictionary = {}
+# id -> PackedVector2Array of the 4 marker corners in the frame's own pixel space, straight from
+# the C++ detector. Debug data for the TCP overlay ONLY -- the poses above are what the app runs on.
+var _result_corners: Dictionary = {}
 var _result_capture_usec := 0
 var _result_cam_xform := Transform3D.IDENTITY   # head pose the markers were baked with (trace only)
 
@@ -249,6 +252,31 @@ var _tcp_reconnect_timer := 0.0
 var _last_tcp_status := -1
 var _tcp_send_timer := 0.0
 const TCP_SEND_INTERVAL := 0.01
+# The frame the in-flight (or just finished) detection task is working on, kept so the streamer can
+# send it TOGETHER with that detection's corners -- the corners only exist once the worker is done,
+# so a frame sent at arrival time could never carry them. Overwritten on every dispatch.
+var _stream_img: Image
+# Reference for the reprojection overlay in _stream_detected_frame: marker world poses, the head
+# pose they were solved at, and when they were latched. Only that overlay reads them -- the live
+# path never looks back a frame.
+#
+# Held for REPROJ_BASELINE_MS rather than refreshed every frame, and that is the whole sensitivity
+# of the test. The red-green gap goes as fx * head_turn * lens_error / range, so with fx=435 and a
+# marker at 0.65m a 5mm lens error over the ~80ms between two detections (~5deg of head turn at a
+# brisk 60deg/s) is 0.3px -- invisible. The same error over a second of head turning (~50deg) is
+# ~3px, which is visible. Longer costs nothing when the calibration is RIGHT (a correct world pose
+# is head-independent, so red stays on green however old the reference is); it only bounds how long
+# the marker has to stay continuously in view.
+#
+# 5s rather than 1s so the SAME displacement can be covered slowly or quickly inside one hold --
+# which is the test that separates the two error families, since a geometry error scales with how
+# far the head moved while a timing error scales with how FAST it moved. At 1s a slow sweep could
+# not finish before the reference re-latched, so both speeds could not be compared at equal
+# baseline.
+const REPROJ_BASELINE_MS := 5000.0
+var _prev_stream_poses: Dictionary = {}
+var _prev_stream_xform := Transform3D.IDENTITY
+var _prev_stream_ms := 0
 
 # Outbound frame buffer for the debug streamer. StreamPeerTCP.put_data() BLOCKS until the last
 # byte is gone, so calling it from the main thread hands our frame budget to the receiver: as soon
@@ -637,15 +665,15 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 
 	var img := Image.create_from_data(width, height, false, Image.FORMAT_L8, data)
 
-	# debug outputs (grayscale): preview overlay + TCP frame streamer
+	# debug output (grayscale): preview overlay. The TCP streamer is NOT fed here -- it sends the
+	# frame together with that frame's detected corners, which only exist once the worker is done
+	# (see _stream_detected_frame).
 	if cam_preview.visible:
 		if _preview_texture == null:
 			_preview_texture = ImageTexture.create_from_image(img)
 			cam_preview.texture = _preview_texture
 		else:
 			_preview_texture.update(img)
-	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
-		_send_frame_tcp(img)
 
 	_dispatch_detection(img, cap_usec, cam_xform, frame_id)
 
@@ -658,6 +686,10 @@ func _tracing(frame_id: int) -> bool:
 ####################################################################################################
 func _process(_delta: float) -> void:
 	_poll_tcp(_delta)
+	# Ticked here rather than beside a send site: the debug frame goes out from
+	# _poll_detection_task, which the early returns further down never reach (and on the Android
+	# path _process does not see the frames at all).
+	_tcp_send_timer += _delta
 
 	# Head-pose history: one [t_usec, pose] sample per rendered frame, so a finished detection can
 	# be baked with the pose the head actually had at the frame's capture time (see _head_pose_at).
@@ -764,12 +796,6 @@ func _process(_delta: float) -> void:
 	if debug_prints_enabled:
 		print("[opencv_aruco] [aruco::_process] readback: image_format=%d" % img.get_format())
 
-	_tcp_send_timer += _delta
-	if _tcp_send_timer >= TCP_SEND_INTERVAL:
-		_tcp_send_timer = 0.0
-		if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
-			_send_frame_tcp(img)
-
 	# No sensor timestamp on this path -- approximate the capture time as CAMERA_LATENCY_MS ago
 	# and sample the head pose for that moment right here (it travels with the frame).
 	_flow_frame_counter += 1
@@ -813,6 +839,10 @@ func _poll_detection_task() -> void:
 	WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 	_detect_task_id = -1
 	_apply_detection_result()
+	# Only now do the frame and its corners both exist, so this is the earliest point at which the
+	# overlay can be streamed as one consistent pair -- and it has to happen BEFORE the pending
+	# frame below is handed on, since that overwrites _stream_img with the next frame.
+	_stream_detected_frame()
 	if _has_pending:
 		var img := _pending_image
 		var capture_usec := _pending_capture_usec
@@ -831,6 +861,9 @@ func _start_detection_task(img: Image, capture_usec: int, cam_xform: Transform3D
 	# _poll_detection_task -- come through here. (It no longer has to happen here for thread-safety;
 	# the table this used to rebuild lives in C++ now and is resolved per detection.)
 	_sync_marker_sizes()
+	# Held for the debug streamer: _poll_detection_task sends THIS frame once the task below has
+	# produced the corners that belong to it.
+	_stream_img = img
 	_detect_task_id = WorkerThreadPool.add_task(_detect_frame.bind(img, capture_usec, cam_xform, frame_id),
 			false, "opencv_aruco marker detection")
 
@@ -926,6 +959,55 @@ func _handeye_record(head: Transform3D, markers: Dictionary) -> void:
 				_handeye_kept, HANDEYE_MAX_SAMPLES])
 
 
+# id -> [world position, head rotation] as of the FIRST detection of that id. Reference point for the
+# drift readout in _apply_detection_result, which exists to answer one question the rest of the
+# pipeline cannot: when the mesh appears to slide against a stationary marker, is the world ESTIMATE
+# moving, or only its apparent alignment? Passthrough is a reprojected image, not optical see-through,
+# so a pose that is rock steady in world space can still look like it slides as the head turns --
+# and no amount of lens-pose work touches that. Comparing the estimate against itself takes the
+# passthrough out of the loop entirely.
+# Never cleared, so the reference survives a dropout and the drift stays comparable across the whole
+# session; bounded by the marker count, same as _marker_poses.
+var _drift_ref: Dictionary = {}
+# id -> the world positions seen so far while the reference is still forming; dropped once it locks.
+var _drift_seed: Dictionary = {}
+# id -> head rotation at the FIRST detection. head_deg is measured from this, and it is deliberately
+# the first sample rather than a median: it is an angle datum, not a noisy measurement, and the head
+# is held still while the reference forms anyway.
+var _drift_rot: Dictionary = {}
+# How many detections the position reference is averaged over before it locks. Seeding from ONE
+# detection makes every later drift_mm hostage to that sample's noise -- measured on device the
+# per-frame position jitter is ~2.5mm peak-to-peak, so a lone outlier at seeding time offsets the
+# whole session by a constant and reads exactly like a real standing error. ~1.5s of detections.
+const DRIFT_REF_SAMPLES := 20
+
+
+# Component-wise median of the seed window for `id`, recomputed until the window fills and then
+# frozen. Median rather than mean so a single bad detection during seeding cannot drag the datum.
+func _drift_reference_pos(id: int, pos: Vector3) -> Vector3:
+	if _drift_ref.has(id):
+		return _drift_ref[id]
+	var seed: Array = _drift_seed.get(id, [])
+	seed.append(pos)
+	_drift_seed[id] = seed
+	var xs: Array = []
+	var ys: Array = []
+	var zs: Array = []
+	for p in seed:
+		xs.append(p.x)
+		ys.append(p.y)
+		zs.append(p.z)
+	xs.sort()
+	ys.sort()
+	zs.sort()
+	var mid: int = seed.size() / 2
+	var med := Vector3(xs[mid], ys[mid], zs[mid])
+	if seed.size() >= DRIFT_REF_SAMPLES:
+		_drift_ref[id] = med           # locked; the seed window is dead weight from here on
+		_drift_seed.erase(id)
+	return med
+
+
 func _apply_detection_result() -> void:
 	var markers: Dictionary = _result_markers
 	var result_id: int = _result_frame_id
@@ -955,6 +1037,33 @@ func _apply_detection_result() -> void:
 		_get_or_create_patch(id).global_transform = markers[id]
 		_marker_last_seen[id] = now_usec
 		seen_ids.append(id)
+		# How far this marker's WORLD estimate has wandered from where it was first seen, against how
+		# far the head has turned since. The marker does not move, so every millimetre of drift_mm is
+		# error -- and the correlation is the diagnosis:
+		#   drift_mm grows with head_deg -> the error is conjugated by the head transform, i.e. it
+		#     lives in the lens pose or the head pose, and calibration is the fix.
+		#   drift_mm stays flat while head_deg swings -> the pose chain is solid and what you SEE
+		#     moving is the render against passthrough's reprojection, which calibration cannot touch.
+		# dist_m is printed because it separates the two halves of a lens-pose error: a ROTATIONAL one
+		# scales with it, a TRANSLATIONAL one does not. The hand-eye capture spanned only 0.51-0.60m,
+		# so that split is the least-constrained thing in the current calibration -- watch drift_mm as
+		# you walk toward and away from a marker, not just as you turn your head.
+		# Gated on debug_prints_enabled rather than _tracing(): this needs EVERY detection to be
+		# readable as a sweep, not one frame in DEBUG_FLOW_EVERY.
+		if debug_prints_enabled:
+			var head_rot := _result_cam_xform.basis.get_rotation_quaternion()
+			if not _drift_rot.has(id):
+				_drift_rot[id] = head_rot
+			var ref_pos := _drift_reference_pos(id, markers[id].origin)
+			var ref_rot: Quaternion = _drift_rot[id]
+			# Lines still marked SEEDING have a reference that is still moving under them, so their
+			# drift_mm is not comparable with the rest -- drop them before reading the sweep.
+			print("[opencv_aruco] [aruco::_apply_detection_result] marker drift: id=%d drift_mm=%.1f head_deg=%.1f dist_m=%.2f world_pos=%v%s" % [
+					id, (markers[id].origin - ref_pos).length() * 1000.0,
+					rad_to_deg(head_rot.angle_to(ref_rot)),
+					_result_cam_xform.origin.distance_to(markers[id].origin),
+					markers[id].origin,
+					"" if _drift_ref.has(id) else " SEEDING"])
 		if _tracing(result_id):
 			# frozen at this world pose until the next detection
 			print("[opencv_aruco] [aruco::_apply_detection_result] flow #%d (10) marker assigned: id=%d world_pos=%v" % [
@@ -1001,7 +1110,12 @@ func _detect_frame(img: Image, capture_usec: int, cam_xform: Transform3D, frame_
 	# The head pose at CAPTURE time is the only thing that has to travel with the frame; intrinsics,
 	# distortion, downscale, marker sizes and the lens pose are all properties, re-read there. The
 	# markers come back in WORLD space, with head_pose * lens_pose already applied to each.
-	var markers: Dictionary = detect_markers(img, cam_xform)
+	# Out-parameter for the debug overlay: Dictionaries are shared references in Godot, so the C++
+	# side writes the detected pixel corners into THIS instance. Built fresh per detection (rather
+	# than clearing _result_corners) so the main thread can never see a half-filled dictionary --
+	# the slot is only re-pointed at the end, past the same barrier as _result_markers.
+	var corners: Dictionary = {}
+	var markers: Dictionary = detect_markers(img, cam_xform, corners)
 	# Guarded inline rather than via a helper function: a helper would build this string on every
 	# detection before it could check the flag.
 	if debug_prints_enabled:
@@ -1015,6 +1129,7 @@ func _detect_frame(img: Image, capture_usec: int, cam_xform: Transform3D, frame_
 			print("[opencv_aruco] [aruco::_detect_frame] flow #%d (7) detection done: detect_ms=%.1f markers=%d (world space; parking result for the main thread)" % [
 					frame_id, detect_ms, markers.size()])
 	_result_markers = markers
+	_result_corners = corners
 	_result_capture_usec = capture_usec
 	_result_cam_xform = cam_xform
 	_result_frame_id = frame_id
@@ -1159,9 +1274,78 @@ func _exit_tree() -> void:
 		print("[opencv_aruco] [aruco::_exit_tree] handeye capture closed: samples=%d path=%s" % [
 				_handeye_kept, ProjectSettings.globalize_path(HANDEYE_PATH)])
 
+# Send the last detected frame plus its corners, at most every TCP_SEND_INTERVAL. Called from
+# _poll_detection_task, i.e. once per finished detection (~12/s on Quest) rather than once per
+# camera frame -- the interval only throttles further, it can no longer force a send.
+func _stream_detected_frame() -> void:
+	if _stream_img == null:
+		return
+	if _tcp_send_timer < TCP_SEND_INTERVAL:
+		return
+	_tcp_send_timer = 0.0
+	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
+		# Second overlay: the world poses latched up to REPROJ_BASELINE_MS ago, projected into THIS
+		# frame. Deliberately cross-frame. Reprojecting a frame's own poses with its own head pose
+		# cancels algebraically -- the C++ multiplied by head_pose * lens_pose and
+		# project_marker_corners divides by it again, leaving M_1 exactly -- so it would draw a
+		# perfect square however wrong lens_pose is. Only a head pose that has CHANGED since the
+		# latch makes lens_pose stop cancelling, which is why the head has to move for this to mean
+		# anything and why the baseline angle travels with the frame.
+		var reproj := project_marker_corners(_prev_stream_poses, _result_cam_xform)
+		# How far the head has moved since the reference was latched -- measured against the
+		# reference that produced `reproj`, so both have to be read BEFORE the re-latch below. Zero
+		# while there is no reference yet, where the identity placeholder would otherwise report the
+		# head's absolute pose as if it were a baseline.
+		#
+		# BOTH numbers travel, because they drive DIFFERENT errors and neither substitutes for the
+		# other. Turning the head is what makes a lens_translation error show up. Strafing cannot:
+		# with the head orientation fixed the relative motion A is a pure translation and
+		# L^-1 A L = [I | R_L^T d], in which t_L has cancelled out entirely. What a strafe does
+		# reveal is anything that puts the marker at the wrong DEPTH -- a wrong aruco_patch_size or
+		# focal length -- because parallax against a wrongly-placed point grows with viewpoint
+		# change, plus a lens_rotation error through the surviving R_L.
+		var baseline_deg := 0.0
+		var baseline_m := 0.0
+		if not _prev_stream_poses.is_empty():
+			baseline_deg = rad_to_deg(_result_cam_xform.basis.get_rotation_quaternion().angle_to(
+					_prev_stream_xform.basis.get_rotation_quaternion()))
+			baseline_m = _result_cam_xform.origin.distance_to(_prev_stream_xform.origin)
+		var now_ms := Time.get_ticks_msec()
+		if _prev_stream_poses.is_empty() or now_ms - _prev_stream_ms >= REPROJ_BASELINE_MS:
+			_prev_stream_poses = _result_markers.duplicate()
+			_prev_stream_xform = _result_cam_xform
+			_prev_stream_ms = now_ms
+		_send_frame_tcp(_stream_img, _result_corners, reproj, baseline_deg, baseline_m)
+
+
 # Buffers one frame for the debug streamer and pushes what fits right now. Never blocks; drops the
 # frame outright while the previous one is still on its way out (see _tcp_out).
-func _send_frame_tcp(img: Image) -> void:
+#
+# Wire format, big-endian throughout, consumed by tools/tcp_receiver.py:
+#   header:  width u32, height u32, image_format u32, payload_size u32      (16 bytes)
+#   payload: payload_size raw Image bytes
+#   markers: marker_count u32, then per marker id u32 + 8 f32               (36 bytes each)
+#            = the 4 corners as x0,y0,..,x3,y3 in the payload's own pixel space.
+#   reproj:  a SECOND block in exactly the same layout -- the latched world poses projected back
+#            into this frame (see _stream_detected_frame for what it tests).
+#   trailer: baseline_deg f32, baseline_m f32 = how far the head has turned and moved since those
+#            poses were latched. Without them the pixel gap the receiver prints is uninterpretable:
+#            the gap scales with the baseline and is zero at zero, so "0.4px" means "calibrated"
+#            after 50deg of turning and means "you stood still" after 2deg. Both are sent because
+#            they drive different errors -- turning exposes lens_translation, strafing exposes
+#            marker size / focal length (see _stream_detected_frame).
+# The extra blocks are APPENDED after the image so the original 16-byte header stayed as it was, and
+# all of them are always written, count 0 included: the receiver reads a fixed structure per frame,
+# so an omitted block would desync every frame after it. Sender and receiver therefore have to be
+# updated together -- an older tcp_receiver.py reads this frame's tail as the next frame's header.
+# Corner count per marker is fixed at 4 (guaranteed by the C++ side), hence no per-marker length.
+# It is built into the SAME buffer as header and payload, not written to the socket separately:
+# _tcp_out drains asynchronously, so anything put on the socket by hand would overtake the pixels
+# still queued in front of it. Being one buffer also makes a dropped frame drop its markers with
+# it -- the receiver reads a fixed number of bytes per frame, so a half-sent pair would desync
+# every following frame too.
+func _send_frame_tcp(img: Image, corners: Dictionary, reproj: Dictionary, baseline_deg: float,
+		baseline_m: float) -> void:
 	if stream_peer == null:
 		return
 
@@ -1189,13 +1373,43 @@ func _send_frame_tcp(img: Image) -> void:
 	frame.append_array(_be_u32(bytes.size()))
 	frame.append_array(bytes)
 
+	frame.append_array(_marker_block(corners))
+	frame.append_array(_marker_block(reproj))
+	frame.append_array(_be_f32(baseline_deg))
+	frame.append_array(_be_f32(baseline_m))
+
 	_tcp_out = frame
 	_flush_tcp()
+
+
+# One marker block: count u32, then id u32 + 8 big-endian f32 per marker. Two of these go out per
+# frame (detected corners first, then reprojected ones) and the receiver reads them with the same
+# function, so the layout is factored out here rather than written twice.
+func _marker_block(markers: Dictionary) -> PackedByteArray:
+	var block := PackedByteArray()
+	block.append_array(_be_u32(markers.size()))
+	for id in markers:
+		block.append_array(_be_u32(id))
+		var pts: PackedVector2Array = markers[id]
+		for p in pts:
+			block.append_array(_be_f32(p.x))
+			block.append_array(_be_f32(p.y))
+	return block
 
 
 func _be_u32(value: int) -> PackedByteArray:
 	return PackedByteArray([
 			(value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+
+
+# IEEE 754 single, big-endian. encode_float writes little-endian, and the buffer is exactly the
+# four bytes of that one value, so reversing it IS the byte swap.
+func _be_f32(value: float) -> PackedByteArray:
+	var b := PackedByteArray()
+	b.resize(4)
+	b.encode_float(0, value)
+	b.reverse()
+	return b
 
 
 # Hands the socket as much of the buffered frame as it will take without waiting. Called once per

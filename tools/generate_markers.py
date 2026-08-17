@@ -5,8 +5,8 @@ the older DICT_4X4_50 will NOT be found any more -- everything has to be reprint
 
 IMPORTANT -- what "size" means here:
     --size-mm is the side of the BLACK SQUARE, edge to edge, INCLUDING the marker's own 1-module
-    black border. That is exactly the length solvePnP is given via aruco_patch_sizes /
-    aruco_patch_size in project/main_3d.gd. The white quiet zone around it is NOT part of that
+    black border. That is exactly the length solvePnP is given via the OpenCVProcessor node's
+    aruco_patch_sizes / aruco_patch_size. The white quiet zone around it is NOT part of that
     measurement. Getting this wrong scales every pose by the same factor, so measure the printed
     black square with a ruler and put THAT number into the inspector.
 

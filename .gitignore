@@ -36,6 +36,13 @@ bin/windows/*
 # Python bytecode cache
 __pycache__/
 
+# Python venv for tools/ (tcp_receiver, handeye_solve, plot_reproj_log, cameraCalibration).
+# Recreate with: py -3 -m venv .venv && ./.venv/Scripts/python.exe -m pip install -r tools/requirements.txt
+.venv/
+
+# Debug captures written by tools/tcp_receiver.py -- per-session measurement data, not source
+tools/images/
+
 .sconsign*.dblite
 
 # Ignore custom.py

@@ -1,0 +1,17 @@
+# Python deps for everything in tools/. Install into a venv at the PROJECT ROOT -- the scripts use
+# paths relative to it (tcp_receiver writes tools/images/, plot_reproj_log reads it back), so they
+# are all run from there:
+#
+#   py -3 -m venv .venv
+#   ./.venv/Scripts/python.exe -m pip install -r tools/requirements.txt
+#
+# opencv-CONTRIB, not plain opencv-python: cv2.aruco lives in the contrib modules, and
+# tcp_receiver.py draws both overlays with cv2.aruco.drawDetectedMarkers. Installing both packages
+# side by side makes them fight over the same cv2 namespace -- pick contrib only.
+opencv-contrib-python==5.0.0.93
+
+# handeye_solve.py needs nothing else: no cv2, no scipy, deliberately (see its header).
+numpy==2.5.2
+
+# plot_reproj_log.py only.
+matplotlib==3.11.1
