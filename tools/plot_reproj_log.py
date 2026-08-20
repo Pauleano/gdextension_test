@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """Plot the corner log written by tcp_receiver.py's 'l' key.
 
-    py -3 tools/plot_reproj_log.py tools/images/reproj_log.csv
+    py -3 tools/plot_reproj_log.py tools/reproj_logs/reproj_log_20260819_143512.csv
 
 What the log holds: per frame and marker, corner 0 of the DETECTED quad (green in the overlay)
 and of the REPROJECTED one (red), plus how far the head had turned and moved since the world
 poses were latched. The reprojection is deliberately cross-frame, so the red-green gap is only
-meaningful relative to those baselines -- see recv_markers() in tcp_receiver.py.
+meaningful relative to those baselines -- see parse_markers() in tcp_receiver.py.
 
 The point of plotting it rather than watching the overlay: the overlay shows the gap, but only
 the log shows whether the gap is PROPORTIONATE to the head motion that produced it. Figure 2 is
@@ -16,37 +16,48 @@ sweeps far more degrees across the image than the head reportedly turned, the fa
 of the reprojection -- in the head pose itself -- and no calibration value will move it.
 """
 
+import os
 import sys
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-# MUST match camera_intrinsics in src/OpenCVProcessor.h.
-FX = 435.37335635
-FY = 435.96983202
-CX = 320.84589009
-CY = 241.55014114
+# The drawing vocabulary shared with plot_marker_pos.py -- palette, the NaN-gapping, the robust
+# clipping and the dots-are-samples convention. Shared rather than copied so the two scripts cannot
+# drift into making different promises about the same kind of panel; see plotlib.py. (They had:
+# robust_ylim/mark_offscale/trace grew up in the other script and this one never got them, so a
+# single bad solve could set the scale of a panel here while the same spike was clipped and counted
+# over there.)
+from plotlib import (C_ACCENT, C_AXES, C_INK, C_MUTED, gapped, load, mark_offscale, robust_ylim,
+                     sample_note, style, trace)
+
+# MUST match camera_intrinsics in src/OpenCVProcessor.h -- and, if the scene overrides that property,
+# the value in project/aruco_markers.tscn, which is what the device actually ran with.
+FX = 436.90348444
+FY = 436.86219469
+CX = 321.49573022
+CY = 239.71397166
+
+# The columns a corner log must have. Checked on load so pointing this at a marker_pos CSV -- the
+# other log in the same tools/ tree, with a similar name -- says so by name instead of failing as a
+# KeyError inside a figure.
+REQUIRED_COLS = ("frame", "id", "dist", "green_x", "green_y", "red_x", "red_y",
+                 "baseline_deg", "baseline_m")
 
 # Semantic, not decorative: these ARE the overlay's colours, so the plot reads against what was on
 # screen. Red/green is the classic colour-vision-deficient pair, so both tracks additionally carry
-# a distinct line style and a direct label -- identity is never colour alone.
+# a distinct line style and a direct label -- identity is never colour alone. Local rather than in
+# plotlib: they mean "detected vs reprojected", which is a distinction only this script draws.
 C_GREEN = "#1b9e4b"
 C_RED = "#d1341f"
-C_ACCENT = "#2f6fd0"
-C_GRID = "#d8d8d8"
-C_INK = "#222222"
-C_MUTED = "#777777"
-
-
-def load(path):
-    """CSV -> dict of column name to array, with rows sorted by frame."""
-    raw = np.genfromtxt(path, delimiter=",", names=True)
-    if raw.size == 0:
-        raise SystemExit("empty log")
-    cols = {n: np.atleast_1d(raw[n]).astype(float) for n in raw.dtype.names}
-    order = np.argsort(cols["frame"], kind="stable")
-    return {k: v[order] for k, v in cols.items()}
+# Per-marker identity in the cross-id figure. Deliberately NOT the green/red pair used for the two
+# overlays -- that pair already means "detected vs reprojected" everywhere else in this file, and
+# reusing it for marker ids would make two different distinctions share one colour language. Blue /
+# orange separates under every common colour-vision deficiency, and marker shape carries the same
+# information again so identity never rests on colour alone.
+C_IDS = ["#2f6fd0", "#d95f02"]
+M_IDS = ["o", "^"]
 
 
 def split_holds(baseline_deg):
@@ -65,18 +76,6 @@ def split_holds(baseline_deg):
     return [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b - a >= 3]
 
 
-def gapped(frame, value):
-    """Insert NaN across dropped frames so the line breaks instead of interpolating over a gap.
-
-    Without this a 10-frame dropout is drawn as a straight segment, which looks exactly like a
-    slow steady drift and is the one artefact that would mislead the reading.
-    """
-    f = np.arange(int(frame[0]), int(frame[-1]) + 1, dtype=float)
-    v = np.full(f.shape, np.nan)
-    v[(frame - frame[0]).astype(int)] = value
-    return f, v
-
-
 def excursion_deg(x, y):
     """Angle between each frame's bearing and the FIRST frame's, in degrees.
 
@@ -91,18 +90,6 @@ def excursion_deg(x, y):
     return np.degrees(np.arccos(np.clip(b @ b[0], -1.0, 1.0)))
 
 
-def style(ax):
-    ax.grid(True, color=C_GRID, linewidth=0.6, alpha=0.7)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(C_GRID)
-    ax.tick_params(colors=C_MUTED, labelsize=8)
-    ax.yaxis.label.set_color(C_INK)
-    ax.xaxis.label.set_color(C_INK)
-
-
 def mark_holds(ax, frame, holds):
     for a, _b in holds[1:]:
         ax.axvline(frame[a], color=C_MUTED, linewidth=0.8, alpha=0.5, zorder=0)
@@ -114,40 +101,51 @@ def figure_tracks(d, holds, mid):
     Deliberately four panels and not two with twin axes: gap, angle, degrees and metres have
     unrelated scales, and overlaying them on a second y-axis invents visual crossings that carry
     no meaning.
+
+    Which panels get robust_ylim is a per-panel decision and not a default, because the outliers
+    mean different things in each. In the corner tracks a single bad solve is noise and must not be
+    allowed to set the scale. In the two baseline panels the PEAK is the measurement -- how far the
+    head got before the latch reset -- so clipping the top of the ramp would remove the number being
+    read. The gap panel is already on a log scale, which absorbs the spikes without hiding them.
     """
     fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True, layout="constrained",
                              gridspec_kw={"height_ratios": [1.3, 1.3, 1, 1]})
     fig.suptitle("Reprojection gap vs. head motion  |  marker id %d" % mid,
                  fontsize=13, color=C_INK, x=0.06, ha="left")
 
-    f, v = gapped(d["frame"], d["dist"])
     ax = axes[0]
-    ax.plot(f, v, color=C_ACCENT, linewidth=2.0)
+    trace(ax, d["frame"], d["dist"], C_ACCENT)
     ax.set_yscale("log")
     ax.set_ylabel("red-green gap (px, log)")
     ax.set_title("Grey rules = latch reset. Within a hold the gap should stay flat and small.",
                  fontsize=9, color=C_MUTED, loc="left", pad=6)
 
     ax = axes[1]
-    fg, vg = gapped(d["frame"], d["green_x"])
-    fr, vr = gapped(d["frame"], d["red_x"])
-    ax.plot(fg, vg, color=C_GREEN, linewidth=2.0, linestyle="-", label="detected (green)")
-    ax.plot(fr, vr, color=C_RED, linewidth=2.0, linestyle="--", label="reprojected (red)")
+    fg, vg = trace(ax, d["frame"], d["green_x"], C_GREEN, "-")
+    fr, vr = trace(ax, d["frame"], d["red_x"], C_RED, "--")
+    # Both tracks share one scale by definition -- the whole point is how far apart they are -- so
+    # the limits come from the pair, not from either one.
+    lim = robust_ylim(ax, np.concatenate([vg, vr]))
+    mark_offscale(ax, fg, vg, lim)
+    mark_offscale(ax, fr, vr, lim)
+    ax.plot([], [], color=C_GREEN, linestyle="-", label="detected (green)")
+    ax.plot([], [], color=C_RED, linestyle="--", label="reprojected (red)")
     ax.set_ylabel("corner 0, x (px)")
     ax.legend(frameon=False, fontsize=8, labelcolor=C_INK, loc="upper right")
     ax.set_title("If these diverge, the two are not describing the same head motion.",
                  fontsize=9, color=C_MUTED, loc="left", pad=6)
 
     ax = axes[2]
-    f, v = gapped(d["frame"], d["baseline_deg"])
-    ax.plot(f, v, color=C_ACCENT, linewidth=2.0)
+    trace(ax, d["frame"], d["baseline_deg"], C_ACCENT)
     ax.set_ylabel("head turn since latch (deg)")
 
     ax = axes[3]
-    f, v = gapped(d["frame"], d["baseline_m"] * 1000.0)
-    ax.plot(f, v, color=C_ACCENT, linewidth=2.0)
+    trace(ax, d["frame"], d["baseline_m"] * 1000.0, C_ACCENT)
     ax.set_ylabel("head move since latch (mm)")
     ax.set_xlabel("frame")
+    # Bottom right, which is the one corner no panel here occupies: the gap panel fills its top, the
+    # corner tracks arch through their middle and the two baselines ramp along the diagonal.
+    sample_note(ax, "lower right")
 
     for ax in axes:
         style(ax)
@@ -197,13 +195,175 @@ def figure_consistency(d, holds, mid):
     return fig, ga, ra, ba
 
 
+def figure_diagnostics(d, ids):
+    """The two questions the per-id figures cannot answer.
+
+    LEFT -- gap against head DISPLACEMENT. Turning the head exposes lens_translation; only strafing
+    exposes a wrong marker size or focal length, because those put the marker at the wrong depth and
+    it takes a viewpoint change for parallax to reveal that. A run whose displacement never grew has
+    simply not tested that family, however small its gap looked.
+
+    RIGHT -- the same frame's gap for one marker against the other. Two markers are different
+    physical objects with independent detections and independently latched poses, so a per-marker
+    fault (wrong size, planar-pose ambiguity, a bad latch) lands OFF the diagonal. Only a fault in
+    what they share -- the head pose, the lens pose -- can push both at once, which puts points ON
+    it. That distinction is not visible in either marker's own time series.
+    """
+    has_axes = all(k in d for k in ("dx_m", "dy_m", "dz_m"))
+    fig, axes = plt.subplots(1, 3 if has_axes else 2,
+                             figsize=(18 if has_axes else 13, 5.4), layout="constrained")
+
+    ax = axes[0]
+    for slot, mid in enumerate(ids):
+        sel = d["id"].astype(int) == mid
+        ax.scatter(d["baseline_m"][sel], np.maximum(d["dist"][sel], 0.05), s=9, alpha=0.28,
+                   color=C_IDS[slot % 2], marker=M_IDS[slot % 2], linewidths=0,
+                   label="marker %d" % mid)
+    # Binned medians on top: the cloud shows spread, the line shows the trend that a residual scale
+    # error would produce. Drawn in ink rather than a series colour -- it is a summary of both.
+    edges = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.60, 10.0])
+    xs, ys = [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = (d["baseline_m"] >= lo) & (d["baseline_m"] < hi)
+        if sel.sum() > 20:
+            xs.append(np.median(d["baseline_m"][sel]))
+            ys.append(np.median(d["dist"][sel]))
+    if xs:
+        ax.plot(xs, ys, color=C_INK, linewidth=2.0, marker="s", markersize=5, zorder=5,
+                label="median per bin")
+    ax.set_yscale("log")
+    ax.set_xlabel("head displacement since latch (m)")
+    ax.set_ylabel("red-green gap (px, log)")
+    ax.set_title("Does the gap grow with STRAFING?\nrising median = residual depth/scale error",
+                 fontsize=10, color=C_INK, loc="left", pad=8)
+    ax.legend(frameon=False, fontsize=8, labelcolor=C_INK, loc="upper left")
+    style(ax)
+
+    if has_axes:
+        # WHICH axis drives the gap. The displacement arrives split into the latched head's own frame,
+        # and the three directions do genuinely different things: sideways and vertical move the
+        # viewpoint ACROSS the marker and so generate parallax -- that is what a wrong depth (marker
+        # size, focal length) shows up in -- while forward/back only changes the range. A gap that
+        # rides on the lateral curve and ignores the forward one is a depth error; one that tracks
+        # range instead points at something scaling with distance.
+        ax = axes[1]
+        lateral = np.hypot(d["dx_m"], d["dy_m"])
+        series = [("sideways + vertical (parallax)", lateral, "-"),
+                  ("forward / back (range)", np.abs(d["dz_m"]), "--"),
+                  ("total displacement", d["baseline_m"], ":")]
+        # Quantile edges, not equal width: displacement is heavily bottom-loaded (most frames sit
+        # early in a hold), so equal-width bins would crowd thousands of samples into the first and
+        # leave a handful in the last -- exactly where the signal is. The bin COUNT scales with the
+        # sample count so every bin keeps ~80 rows, which is far more than a median needs; a fixed
+        # count was coarse on long logs, but the cap stays LOW on purpose: the motion has plateaus, so
+        # fine bins slice through a cluster and the medians then order by which hold they fell in
+        # rather than by displacement, which reads as a zigzag that means nothing. This only affects
+        # what the curves LOOK like -- the slopes in the title come from a fit over every row.
+        n_bins = int(np.clip(len(d["dist"]) // 120, 5, 9))
+        for slot, (label, mag, ls) in enumerate(series):
+            edges = np.unique(np.quantile(mag, np.linspace(0.0, 1.0, n_bins + 1)))
+            xs, ys = [], []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                sel = (mag >= lo) & (mag < hi)
+                if sel.sum() > 15:
+                    xs.append(np.median(mag[sel]))
+                    ys.append(np.median(d["dist"][sel]))
+            if xs:
+                ax.plot(xs, ys, color=C_AXES[slot], linewidth=2.0, linestyle=ls, marker="o",
+                        markersize=5, label=label)
+        # The curves alone CANNOT attribute cause, and reading them that way is a trap: each is
+        # plotted against its own axis, and in any real sweep the axes are correlated (you cannot
+        # strafe without also drifting forward). An axis that only ever covered 0.2m looks steeper
+        # than one that covered 0.9m even when it drives nothing at all. So the attribution is done
+        # by a joint least-squares fit instead, whose slopes are px per metre and therefore directly
+        # comparable across axes -- and the axis correlation is printed beside them, because a high
+        # one means the split is weakly identified however clean the fit looks.
+        fwd = np.abs(d["dz_m"])
+        A = np.column_stack([np.ones_like(lateral), lateral, fwd])
+        coef, *_ = np.linalg.lstsq(A, d["dist"], rcond=None)
+        r_axes = float(np.corrcoef(lateral, fwd)[0, 1])
+        ax.set_yscale("log")
+        ax.set_xlabel("displacement along that axis (m)")
+        ax.set_ylabel("red-green gap, median (px, log)")
+        ax.set_title("WHICH axis drives it?\nfit: %+.1f px/m lateral, %+.1f px/m forward "
+                     "(axes correlated r=%+.2f)" % (coef[1], coef[2], r_axes),
+                     fontsize=10, color=C_INK, loc="left", pad=8)
+        ax.legend(frameon=False, fontsize=8, labelcolor=C_INK, loc="upper left")
+        style(ax)
+        print("\naxis fit: gap = %+.2f %+.2f*lateral %+.2f*forward  (px, m) | corr(lateral,forward)"
+              " = %+.2f" % (coef[0], coef[1], coef[2], r_axes))
+        if abs(r_axes) > 0.8:
+            print("  axes strongly correlated -- the per-axis split is NOT identifiable from this")
+            print("  run. Record one sweep that is mostly sideways and one mostly toward/away.")
+
+    ax = axes[-1]
+    if len(ids) >= 2:
+        a_id, b_id = ids[0], ids[1]
+        ga = {int(f): g for f, i, g in zip(d["frame"], d["id"], d["dist"]) if int(i) == a_id}
+        gb = {int(f): g for f, i, g in zip(d["frame"], d["id"], d["dist"]) if int(i) == b_id}
+        common = sorted(set(ga) & set(gb))
+        a = np.array([ga[k] for k in common])
+        b = np.array([gb[k] for k in common])
+    if len(ids) >= 2 and len(common) > 0:
+        lim = max(a.max(), b.max()) * 1.3
+        ax.plot([0.05, lim], [0.05, lim], color=C_MUTED, linewidth=1.2, linestyle="--",
+                zorder=1, label="equal (shared cause)")
+        ax.scatter(np.maximum(a, 0.05), np.maximum(b, 0.05), s=10, alpha=0.3,
+                   color=C_ACCENT, linewidths=0, zorder=2)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(0.05, lim)
+        ax.set_ylim(0.05, lim)
+        ax.set_xlabel("marker %d gap (px, log)" % a_id)
+        ax.set_ylabel("marker %d gap (px, log)" % b_id)
+        r = np.corrcoef(a, b)[0, 1]
+        both = int(((a > 10) & (b > 10)).sum())
+        only_a = int(((a > 10) & (b <= 10)).sum())
+        only_b = int(((b > 10) & (a <= 10)).sum())
+        ax.set_title("Do BOTH markers spike together?\ncorrelation %+.2f  |  >10px: both %d, "
+                     "only id%d %d, only id%d %d"
+                     % (r, both, a_id, only_a, b_id, only_b),
+                     fontsize=10, color=C_INK, loc="left", pad=8)
+        ax.legend(frameon=False, fontsize=8, labelcolor=C_INK, loc="upper left")
+        print("\ncross-marker: correlation %+.2f | gap>10px  both=%d  only id%d=%d  only id%d=%d"
+              % (r, both, a_id, only_a, b_id, only_b))
+        print("  on the diagonal = a fault in the SHARED path (head pose / lens pose);")
+        print("  off it = per-marker (size, planar-pose ambiguity, a poisoned latch).")
+    else:
+        # Two ids that never share a frame are as useless here as one id: the comparison is
+        # per-frame by construction, because only then do both markers see the same head pose.
+        ax.text(0.5, 0.5, "needs two marker ids visible in the SAME frames", ha="center",
+                va="center", color=C_MUTED, transform=ax.transAxes)
+    style(ax)
+    return fig
+
+
+def out_path(src, suffix):
+    """PNG name derived from the CSV name, written beside it -- i.e. in tools/reproj_logs/.
+
+    Fixed output names would overwrite the previous log's figures the moment a second log is
+    plotted -- and these logs exist precisely to be compared against each other (one capture per
+    configuration). Deriving the name from the input keeps every run's figures alongside its data,
+    and since tcp_receiver.py now stamps the CSV with its capture time, the figures inherit that
+    stamp and stay identifiable without opening them.
+    """
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return os.path.join(os.path.dirname(src) or ".", "%s_%s.png" % (stem, suffix))
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 1
-    d = load(sys.argv[1])
+    d = load(sys.argv[1], REQUIRED_COLS)
+    ids = sorted(set(d["id"].astype(int)))
 
-    for mid in sorted(set(d["id"].astype(int))):
+    fd = figure_diagnostics(d, ids)
+    p_diag = out_path(sys.argv[1], "diagnostics")
+    fd.savefig(p_diag, dpi=130)
+    print("written: %s" % p_diag)
+
+    for mid in ids:
         sel = d["id"].astype(int) == mid
         one = {k: v[sel] for k, v in d.items()}
         holds = split_holds(one["baseline_deg"])
@@ -238,9 +398,11 @@ def main():
                   " these two to each other, not to 1.0)"
                   % (np.median(ra[good] / ba[good]), np.median(ga[good] / ba[good])))
 
-        f1.savefig("tools/images/reproj_tracks_id%d.png" % mid, dpi=130)
-        f2.savefig("tools/images/reproj_consistency_id%d.png" % mid, dpi=130)
-        print("  written: tools/images/reproj_{tracks,consistency}_id%d.png" % mid)
+        p1 = out_path(sys.argv[1], "tracks_id%d" % mid)
+        p2 = out_path(sys.argv[1], "consistency_id%d" % mid)
+        f1.savefig(p1, dpi=130)
+        f2.savefig(p2, dpi=130)
+        print("  written: %s , %s" % (p1, p2))
 
     # Skipped under a headless backend, where it only warns. The PNGs above are written either way,
     # so a non-interactive run is still useful.

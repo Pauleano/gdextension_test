@@ -18,13 +18,19 @@
 # rotation from the matrix logs, then translation by linear least squares.
 #
 # Usage:
-#     py -3 handeye_solve.py handeye_samples.jsonl
+#     py -3 tools/handeye_solve.py tools/handeye_samples/handeye_samples_20260819_143512.jsonl
 #
-# Pull the file off the headset first. Godot's user:// lands in INTERNAL app storage on this
-# device (/data/data/<pkg>/files/), which `adb pull` cannot reach -- go through run-as, which
-# works because the build is debuggable. Use exec-out rather than shell so the bytes come back
-# without line-ending mangling:
-#     adb exec-out "run-as de.unigreifswald.opencvaruco cat files/handeye_samples.jsonl" > handeye_samples.jsonl
+# Pull the file off the headset first, into tools/handeye_samples/. Godot's user:// lands in
+# INTERNAL app storage on this device (/data/data/<pkg>/files/), which `adb pull` cannot reach --
+# go through run-as, which works because the build is debuggable. Use exec-out rather than shell so
+# the bytes come back without line-ending mangling.
+#
+# Two steps, because the device stamps each capture run with its start time (see HANDEYE_PREFIX in
+# project/detection_diagnostics.gd) and the name is therefore not predictable from here. It is also
+# printed to logcat when the capture opens and again when it closes, so `adb logcat` answers the
+# same question if the headset is still running:
+#     adb exec-out "run-as de.unigreifswald.opencvaruco ls files/"
+#     adb exec-out "run-as de.unigreifswald.opencvaruco cat files/handeye_samples_20260819_143512.jsonl" > tools/handeye_samples/handeye_samples_20260819_143512.jsonl
 
 import json
 import sys

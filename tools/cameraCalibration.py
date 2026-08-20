@@ -20,11 +20,17 @@ objp = np.zeros((1, CHECKERBOARD[0]*CHECKERBOARD[1], 3), np.float32)
 objp[0,:,:2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2)
 prev_img_shape = None
 
-# Extracting path of individual image stored in a given directory
-images = glob.glob('./images/*.jpg')
+# Extracting path of individual image stored in a given directory.
+# An __file__ verankert statt am Arbeitsverzeichnis: das Skript wird von überall aus gestartet, und
+# ein relativer Pfad liefert dann stillschweigend eine leere Liste, statt zu scheitern.
+# saved_from_stream/ ist das Ziel der 's'-Taste in tcp_receiver.py; der frühere Sammelordner images/
+# ist aufgelöst, seine Aufnahmen liegen jetzt hier.
+tools_dir = os.path.dirname(os.path.abspath(__file__))
+images = sorted(glob.glob(os.path.join(tools_dir, 'saved_from_stream', '*.jpg')))
 for fname in images:
-    gray = cv2.imread(fname)
-    #gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) #image is already geyscale
+    # imread decodes to 3 channels by default, auch wenn die Datei grau ist
+    gray = cv2.imread(fname, cv2.IMREAD_GRAYSCALE)
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)  # nur zum Anzeigen der farbigen Ecken
     # Find the chess board corners
     # If desired number of corners are found in the image then ret = true
     ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, cv2.CALIB_CB_ADAPTIVE_THRESH+
