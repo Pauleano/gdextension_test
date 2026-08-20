@@ -10,7 +10,6 @@
 #include <godot_cpp/variant/packed_float64_array.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
-#include <opencv2/videoio.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
 #include <opencv2/core.hpp>
 #include <memory>
@@ -29,8 +28,6 @@ class OpenCVProcessor : public Node {
     GDCLASS(OpenCVProcessor, Node)
 
 private:
-    //kept open across calls; opening DSHOW takes 1-3s, so reusing is essential for per-frame use
-    cv::VideoCapture cap;
     //built once in ctor and reused; dictionary+params are baked in at construction
     std::unique_ptr<aruco_nano::ArucoDetector> detector;
 
@@ -54,16 +51,28 @@ private:
     // Intrinsics (fx, fy, cx, cy) in pixels for the NATIVE 640x480 frame; image_downscale_factor is
     // applied to them at use time, so NEVER bake it in here.
     // Calibrated with tools/cameraCalibration.py from TCP-streamed frames captured through the
-    // GodotAndroidCamera (CameraX) path, i.e. the pipeline that actually runs. That provenance is
-    // the point: the previous set came from the CameraServer readback path and agreed with this one
-    // to 1.5px and 0.2% on the focal lengths, which is what ruled out CameraX picking a different
-    // sensor crop -- a different field of view would have moved fx by percent, not by 0.08%. A
-    // calibration is only valid for the capture path that produced its images, so RE-SHOOT these
-    // after any change to the resolution, the output format, or the camera backend.
-    Vector4 camera_intrinsics = Vector4(435.37335635, 435.96983202, 320.84589009, 241.55014114);
+    // GodotAndroidCamera (CameraX) path, i.e. the pipeline that actually runs. A calibration is only
+    // valid for the capture path that produced its images, so RE-SHOOT these after any change to the
+    // resolution, the output format, or the camera backend.
+    // This is the SECOND CameraX run; it replaced the first (435.37335635, 435.96983202,
+    // 320.84589009, 241.55014114, with a steeper radial model) in 2026-08. They differ by fx +0.351%,
+    // fy +0.205%, cx +0.65px, cy -1.84px -- calibration noise, not a different sensor crop, and well
+    // inside the 1.5px / 0.2% that the older CameraServer-readback set already agreed to (a different
+    // field of view would have moved fx by percent, not by 0.08%). No measurement on the device
+    // separates them cleanly: a focal change of that size is worth ~1.2px of reprojection gap over a
+    // 0.5m STRAFE at 0.65m range (fx * (delta/range) * |1 - 1/k|), i.e. right at the red overlay's
+    // visibility threshold, and essentially nothing under head TURNING, where the focal length barely
+    // enters -- so if the two ever DO need telling apart, strafe, do not turn. The later run ships,
+    // and it is recorded here rather than left as an A/B switch beside a hidden second set: a switch
+    // makes the property in the inspector stop describing the calibration the detection runs on, and
+    // every downstream copy of these numbers (tools/plot_reproj_log.py) silently wrong with it.
+    Vector4 camera_intrinsics = Vector4(436.90348444, 436.86219469, 321.49573022, 239.71397166);
     // OpenCV distCoeffs (k1, k2, p1, p2, k3) for the Quest passthrough lens; an EMPTY array means
     // "no distortion". Filled in the ctor, since a PackedFloat64Array has no inline initialiser.
+    // From the SAME solve as camera_intrinsics above and replaced with it in one edit: a focal length
+    // from one run beside distortion coefficients from another describes no lens that exists.
     PackedFloat64Array camera_distortion;
+
     // Detection resolution knob: 1.0 = native frame, 0.5 = half width AND half height, i.e. a
     // quarter of the pixels -> markedly cheaper detection, at the price of small or distant markers
     // dropping below the resolution the detector needs. It scales the frame AND camera_intrinsics
@@ -82,7 +91,7 @@ private:
     // These two are ONE calibration and must be replaced as a pair -- a rotation from one solve
     // beside a translation from another describes no camera that exists.
     //
-    // DO NOT "fix" these by pasting in what init_quest_intrinsics() logs at startup, however
+    // DO NOT "fix" these by pasting in what dump_quest_camera_metadata() logs at startup, however
     // authoritative that dump looks. It is gyro-referenced: LENS_POSE_REFERENCE == GYROSCOPE means
     // the metadata describes the camera relative to the IMU, while the head pose it gets combined
     // with is the VIEW pose. Those frames differ by the IMU's mounting rotation, which NEITHER api
@@ -132,7 +141,9 @@ private:
     void rebuild_distortion();
     void rebuild_lens_pose();
 
-    //shared detect+solvePnP pipeline; frame is grayscale. used by the godot-image path.
+    //THE detect+solvePnP pipeline, and since the legacy imread/VideoCapture entry points went, the
+    //ONLY one -- so the OpenCV->Godot change of basis (the most error-prone thing in this codebase)
+    //exists exactly once, in one function, with one caller. frame is grayscale.
     //Everything it needs beyond the pixels is a member above: per-id marker sizes, intrinsics,
     //distortion, downscale and the lens pose. head_pose is the ONLY per-frame input -- the head
     //pose at the frame's capture time, which only the caller can know.
@@ -146,16 +157,21 @@ private:
     int current_camera_id =50; //use first back camera and 50 is listed before 51, so camera 50 is always used
     cv::Mat D; //distortions
     bool intrinsics_ready = false;
-    void init_quest_intrinsics();
+    //Android only: reads the Quest passthrough cameras' Camera2 metadata (intrinsics, distortion,
+    //lens pose, pose reference) and LOGS it. Nothing on the live detection path consumes what it
+    //stores -- the calibration in use are the properties above -- so this is a dump, and the name
+    //says so rather than promising an initialisation the detection depends on.
+    void dump_quest_camera_metadata();
 
     //gate for all debug output (ACV_DBG in the .cpp); errors (ACV_ERR) ignore it.
     //static on purpose: this class is a node AUTHORED IN THE SCENE, so PackedScene constructs it
     //before it applies a single property and long before any _ready -- an instance property could
-    //not be set early enough by anyone. GDScript sets the static, then calls initialize().
+    //not be set early enough by anyone. GDScript sets the static, then calls
+    //dump_build_info_and_intrinsics().
     static bool debug_prints_enabled;
 
-    //initialize() darf nur einmal wirken; siehe dort.
-    bool initialized = false;
+    //dump_build_info_and_intrinsics() darf nur einmal wirken; siehe dort.
+    bool build_info_dumped = false;
 
 protected:
     static void _bind_methods();
@@ -164,16 +180,25 @@ public:
     OpenCVProcessor();
     ~OpenCVProcessor();
 
-    //call from GDScript as OpenCVProcessor.set_debug_prints_enabled(true) BEFORE initialize()
+    //call from GDScript as OpenCVProcessor.set_debug_prints_enabled(true) BEFORE
+    //dump_build_info_and_intrinsics()
     static void set_debug_prints_enabled(bool p_enabled);
 
-    //everything the constructor used to do that prints or touches the device, deferred so the
-    //debug flag above can still gate it. Called from _ready in open_cv_processor.gd; idempotent.
-    void initialize();
+    //Gegenstueck zum Setter, und der Grund dafuer liegt auf der GDScript-Seite: die beiden
+    //Diagnose-Kindknoten (detection_diagnostics.gd, tcp_debug_stream.gd) haengen ihre eigenen Prints
+    //an dasselbe Flag. Frueher lasen sie es als Property vom Host-Skript zurueck, was deren Referenz
+    //auf den Host untypisiert zwang -- ArucoMarkerSource dort zu nennen waere ein zyklischer
+    //Skriptverweis, weil der Host seinerseits DetectionDiagnostics/TcpDebugStream typisiert haelt.
+    //Ueber diesen statischen Getter kommen die Kinder ganz ohne GDScript-Referenz aus, und ihre
+    //Referenz auf den Host darf auf DIESE Klasse typisiert werden (nativ, also ausserhalb jedes
+    //Zyklus). Immer der Wert, den der Setter zuletzt bekommen hat -- eine Quelle, kein Spiegel.
+    static bool get_debug_prints_enabled();
 
-    //function die wir in godot aufrufen wollen
-    Dictionary get_6dof_of_all_aruco_patches_from_picture(const String &file_path);
-    Dictionary get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size);
+    //everything the constructor used to do that prints or touches the device, deferred so the
+    //debug flag above can still gate it -- the OpenCV build configuration plus, on Android, the
+    //Quest passthrough cameras' Camera2 metadata. Purely diagnostic output: nothing here is
+    //required before detect_markers() works. Called from _ready in open_cv_processor.gd; idempotent.
+    void dump_build_info_and_intrinsics();
 
     //THE detection entry point. Takes a frame the caller already owns (the CameraX plugin's Y-plane
     //on Quest, a CameraServer frame on desktop) plus the head pose at that frame's CAPTURE time,

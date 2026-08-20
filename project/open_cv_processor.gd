@@ -35,7 +35,7 @@ const PATCH_LOST_TIMEOUT_MS := 500.0
 var _patch_mesh := BoxMesh.new()
 
 # Single switch for ALL debug output, this script's and the C++ extension's -- _ready pushes it into
-# OpenCVProcessor before calling initialize(). Off by default: with no tcp_receiver.py listening the
+# OpenCVProcessor before calling dump_build_info_and_intrinsics(). Off by default: with no tcp_receiver.py listening the
 # TCP reconnect logs alone would print once per second for the whole session, and the per-frame
 # timing below fires at the camera rate. Errors are never gated and print regardless. DEBUG_FLOW is
 # a SUB-switch of this one: flow tracing needs both (see _tracing).
@@ -50,7 +50,8 @@ var _patch_mesh := BoxMesh.new()
 		# logging. Assigning the property inside its own setter does not recurse in GDScript.
 		# This setter is NOT early enough for the C++ side on its own: the node is built by
 		# PackedScene before any property is applied, which is why everything that prints moved out
-		# of the constructor and into initialize() (called from _ready, right after this flag).
+		# of the constructor and into dump_build_info_and_intrinsics() (called from _ready, right
+		# after this flag).
 		OpenCVProcessor.set_debug_prints_enabled(value)
 		# Same deal for the second extension class; both statics are pushed from this one place so
 		# a toggle in the remote inspector reaches every C++ log line, not just some of them.
@@ -64,36 +65,15 @@ var _patch_mesh := BoxMesh.new()
 # top of each detection, so an edit in the remote inspector of a running deploy takes effect on the
 # next frame. That is new for the lens pose: it used to be derived once here in _ready, so editing
 # it mid-run did nothing at all until a restart.
-# get_lens_pose() returns the decoded transform for the hand-eye capture below.
+# get_lens_pose() returns the decoded transform the hand-eye capture needs -- which is why that
+# capture had to become a CHILD of this node rather than a sibling.
 
-# --- Hand-eye calibration capture (measures T_view->cam directly, all six DOF) ---
-# A measurement run, not a thing to leave on. The lens pose is decoded from Camera2's LENS_POSE_*,
-# which is referenced to the GYROSCOPE, while the detection applies it to the OpenXR VIEW pose. The T_view->gyro factor between those frames is unmodelled -- it is not a number any
-# API hands out (OpenXR has no IMU reference space, Camera2 never mentions the view), so no
-# amount of editing the raw dump converges on it. This collects the raw material for solving it
-# instead: for a STATIONARY marker, H_i * L * M_i must be the SAME world pose for every
-# observation, so L = T_view->cam falls out of enough (H_i, M_i) pairs. That is the classic
-# AX = XB hand-eye problem.
-# M_i costs nothing to obtain: the C++ returns W = (cam_xform * lens_pose) * M_cam, so
-# M_cam = (cam_xform * get_lens_pose()).affine_inverse() * W recovers the camera-space pose exactly.
-# No second detection pass, no extra ~40ms on the frame, and the live path is untouched -- the
-# capture reads the result that was going to be produced anyway.
-@export var handeye_capture := false
-# Samples are kept only when the head has MOVED since the last one. AX = XB is solved from the
-# RELATIVE motion between observations, so a thousand samples taken while holding still carry no
-# information whatsoever -- they only weight the fit toward whichever pose was held longest. The
-# rotation threshold matters more than the translation one: pure translation leaves the rotational
-# part of L unconstrained, which is exactly the part we are chasing.
-const HANDEYE_MIN_ROT_DEG := 2.0
-const HANDEYE_MIN_POS_M := 0.02
-# Enough for a well-conditioned solve many times over; the cap only stops an unattended run from
-# filling the headset's storage.
-const HANDEYE_MAX_SAMPLES := 500
-const HANDEYE_PATH := "user://handeye_samples.jsonl"
-var _handeye_file: FileAccess
-var _handeye_kept := 0                          # frames written, not lines (a frame can see several)
-var _handeye_last_xform := Transform3D.IDENTITY
-var _handeye_has_last := false
+# --- Hand-eye calibration capture ---
+# Gone to the DetectionDiagnostics child node (project/detection_diagnostics.gd), together with the
+# drift readout and the OpenXR timing checks. It is a measurement RUN -- a file, a motion gate and a
+# sample cap of its own -- and nothing here ever read it back. The switch is `handeye_capture` on
+# THAT node now, one level down in the remote inspector; the only thing this script still knows
+# about it is the submit() call in _apply_detection_result.
 
 
 # Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
@@ -122,7 +102,6 @@ var _cam_frame_count := 0
 var _cam_fallback_count := 0           # frames whose timestamp failed the plausibility guard
 var _preview_texture: ImageTexture     # debug preview fed from plugin frames (desktop uses cam_texture)
 var _xr_api: OpenXRAPIExtension        # access to xrWaitFrame's predicted display time (XrTime)
-var _lead_print_timer := 0.0
 
 # --- xrLocateSpace head pose (the measured alternative to the predicted history) ---
 # The pose history below holds poses OpenXR PREDICTED for a display time; even stamped with the
@@ -139,27 +118,10 @@ var _head_locator: OpenXRHeadLocator
 # to the newest pose. Flip it back to compare the two on device -- a frame the locator cannot
 # answer already falls back to the history by itself, so neither setting can strand the app.
 @export var use_xr_locate_space := true
-var _locate_check_timer := 0.0
+# Counted on the LIVE path (see _on_android_camera_frame) and printed by flow trace (4), so it stays
+# here even though its siblings -- the once-a-second pdt/locate checks and their accumulators -- moved
+# to the DetectionDiagnostics child.
 var _locate_fallback_count := 0        # frames on which the locator had no valid pose
-# How far into the past the (B) probe asks, in ms. Chosen to sit at the far end of the real
-# camera latency (sensor timestamp lags ~30-60ms here), so a runtime that only keeps a short
-# tracking history fails the probe rather than passing it and then failing on real frames.
-const LOCATE_PAST_PROBE_MS := 60.0
-# Accumulators for the pdt/_process lockstep check (see the block in _process). Sampled EVERY
-# frame, printed once per second: a per-frame print through logcat at the render rate would slow
-# down the very loop being measured. _pdt_prev survives the window reset, so the first delta of a
-# window is measured against the last frame of the previous one.
-var _pdt_prev := 0                     # pdt of the previous _process; 0 = nothing sampled yet
-var _pdt_prev_now_usec := 0            # Time.get_ticks_usec() of that same _process
-var _pdt_deltas := 0                   # frame-to-frame deltas accumulated in this window
-var _pdt_dupes := 0                    # deltas of exactly 0 -> pdt did NOT advance (the failure mode)
-var _pdt_advance_ns := 0               # summed pdt deltas over the window
-var _pdt_wall_advance_usec := 0        # summed wall-clock deltas over the same frames
-var _pdt_delta_min_ns := 0
-var _pdt_delta_max_ns := 0
-var _lead_sum_ms := 0.0
-var _lead_min_ms := 0.0
-var _lead_max_ms := 0.0
 # All of these reach UP: this script sits on the OpenCVProcessor node, a CHILD of the XROrigin3D
 # scene root, so the nodes it works with are addressed through "..".
 @onready var cam_preview: TextureRect = $"../CameraLayer/CameraPreview"
@@ -232,63 +194,21 @@ var _pending_frame_id := 0         # id travelling with the frame in the input s
 var _result_frame_id := 0          # id travelling with the result in the output slot
 
 
-#stream image of quest to laptop via tcp
-const TCP_HOST := "127.0.0.1"
-const TCP_PORT := 7007			#view available ports with adb reverse --list
+# The frame the in-flight (or just finished) detection task is working on. Handed to the debug
+# streamer once the worker is done, because that detection's corners only exist then -- a frame sent
+# at arrival time could never carry them. Overwritten on every dispatch.
+var _detecting_img: Image
+# Debug frame streamer (project/tcp_debug_stream.gd). A CHILD node, because it calls
+# project_marker_corners() on this one. Optional on purpose: no such child in the scene simply means
+# no streaming, so the diagnostic can be removed by deleting a node rather than editing this script.
+@onready var _debug_stream: TcpDebugStream = get_node_or_null("TcpDebugStream")
+# Measurement apparatus (project/detection_diagnostics.gd): hand-eye capture, marker drift readout,
+# OpenXR timing validation. A CHILD for the same reason as the streamer -- the hand-eye capture calls
+# get_lens_pose() on this one -- and optional in the same way, so the whole facility comes off by
+# deleting a node. Three touch points and no more: configure() in _setup_xr_locator, sample() in
+# _process, submit() in _apply_detection_result.
+@onready var _diagnostics: DetectionDiagnostics = get_node_or_null("DetectionDiagnostics")
 
-# Master switch for the debug streamer, safe to flip at any time -- including from the remote
-# inspector of a running deploy, which is the point: start tcp_receiver.py, turn this on, grab the
-# frames you need, turn it off again. OFF by default, because a streamer nobody is listening to
-# still costs a connect attempt every second for the whole session (and a log line with it), and on
-# device that is the normal case.
-# There is deliberately no setter: _poll_tcp runs every frame and reconciles the socket against this
-# flag, so switching it on connects on the next frame and switching it off closes on the next frame,
-# with no way for the two to disagree and nothing that depends on when the value was set. Both send
-# sites already gate on `stream_peer != null`, so a closed socket also stops frames being encoded.
-@export var tcp_stream_enabled := false
-
-var stream_peer: StreamPeerTCP
-var _tcp_reconnect_timer := 0.0
-var _last_tcp_status := -1
-var _tcp_send_timer := 0.0
-const TCP_SEND_INTERVAL := 0.01
-# The frame the in-flight (or just finished) detection task is working on, kept so the streamer can
-# send it TOGETHER with that detection's corners -- the corners only exist once the worker is done,
-# so a frame sent at arrival time could never carry them. Overwritten on every dispatch.
-var _stream_img: Image
-# Reference for the reprojection overlay in _stream_detected_frame: marker world poses, the head
-# pose they were solved at, and when they were latched. Only that overlay reads them -- the live
-# path never looks back a frame.
-#
-# Held for REPROJ_BASELINE_MS rather than refreshed every frame, and that is the whole sensitivity
-# of the test. The red-green gap goes as fx * head_turn * lens_error / range, so with fx=435 and a
-# marker at 0.65m a 5mm lens error over the ~80ms between two detections (~5deg of head turn at a
-# brisk 60deg/s) is 0.3px -- invisible. The same error over a second of head turning (~50deg) is
-# ~3px, which is visible. Longer costs nothing when the calibration is RIGHT (a correct world pose
-# is head-independent, so red stays on green however old the reference is); it only bounds how long
-# the marker has to stay continuously in view.
-#
-# 5s rather than 1s so the SAME displacement can be covered slowly or quickly inside one hold --
-# which is the test that separates the two error families, since a geometry error scales with how
-# far the head moved while a timing error scales with how FAST it moved. At 1s a slow sweep could
-# not finish before the reference re-latched, so both speeds could not be compared at equal
-# baseline.
-const REPROJ_BASELINE_MS := 5000.0
-var _prev_stream_poses: Dictionary = {}
-var _prev_stream_xform := Transform3D.IDENTITY
-var _prev_stream_ms := 0
-
-# Outbound frame buffer for the debug streamer. StreamPeerTCP.put_data() BLOCKS until the last
-# byte is gone, so calling it from the main thread hands our frame budget to the receiver: as soon
-# as the Python script or the adb tunnel falls behind, TCP back-pressure stalls _process, the
-# OpenXR frame submission stops with it and the runtime kills the app. So a frame is buffered here
-# instead and drained with put_partial_data() from _poll_tcp, which never blocks. A frame arriving
-# while the previous one is still draining is DROPPED (not queued) -- that caps the lag at one
-# frame and makes the stream self-limit to whatever rate the link and the receiver can really take.
-# Dropping is per whole frame on purpose: a half-sent frame cannot be replaced without desyncing
-# the receiver's header/payload framing.
-var _tcp_out := PackedByteArray()
-var _tcp_dropped := 0
 
 #######################################################################################################
 
@@ -407,13 +327,14 @@ func _ready() -> void:
 	# The property setter already pushed this into the extension at scene-instantiation time; repeat
 	# it here so the flag is also correct when the scene does NOT override the default (the setter
 	# never fires then) and a previous run left the static true.
-	# This ORDER is the whole reason initialize() exists as a separate call: the C++ side prints
-	# (OpenCV build info + Quest intrinsics dump), and its constructor now runs when the SCENE is
-	# instantiated -- before any exported property is applied, and with no scripted node above us to
-	# push the flag any earlier. So the constructor was emptied of everything that talks, and the
-	# talking part waits here, one line after the flag is set.
+	# This ORDER is the whole reason dump_build_info_and_intrinsics() exists as a separate call: the
+	# C++ side prints (OpenCV build info + Quest intrinsics dump), and its constructor now runs when
+	# the SCENE is instantiated -- before any exported property is applied, and with no scripted node
+	# above us to push the flag any earlier. So the constructor was emptied of everything that talks,
+	# and the talking part waits here, one line after the flag is set. Nothing in the detection
+	# depends on it; drop the call and only the log lines go away.
 	OpenCVProcessor.set_debug_prints_enabled(debug_prints_enabled)
-	initialize()
+	dump_build_info_and_intrinsics()
 
 	# Nothing to derive here any more: the lens pose is rebuilt by the C++ setters of
 	# lens_rotation_raw / lens_translation, so it is already correct and stays correct after an
@@ -458,9 +379,8 @@ func _ready() -> void:
 		CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
 		_on_camera_feeds_updated()                          # in case a feed is already present
 
-	# No _connect_tcp() here: _poll_tcp opens the socket on the first frame tcp_stream_enabled is
-	# true, and closes it again when it goes false. Connecting here would be a second place that
-	# decides the socket's state, and it would ignore the flag.
+	# Nothing to do for the debug stream here: the TcpDebugStream child owns its socket end to end
+	# and reconciles it against its own `enabled` flag from its own _process.
 
 # Build the OpenXR head locator, or leave it null when there is no OpenXR at all (desktop run
 # without a headset) -- every caller checks, and _xr_api is tied to the same condition so nothing
@@ -482,6 +402,15 @@ func _setup_xr_locator() -> void:
 	# XRInterface, which has no such signal -- only the OpenXRInterface behind it does.
 	if xr_interface.has_signal("session_stopping"):
 		xr_interface.connect("session_stopping", Callable(_head_locator, "release"))
+	# The once-a-second validation lines live on the diagnostics node. This is the single place that
+	# decides whether the deploy has OpenXR at all, so it is also the only place that may hand the
+	# locator over -- a node that never gets configured stays silent by itself. _play_space_to_world
+	# travels as a Callable rather than being reimplemented there: check (A) is a test of the TIME
+	# argument only as long as both sides convert identically. xr_camera/xr_origin go the same way
+	# rather than being read back off this node, which is what lets that node type its reference to
+	# us as the NATIVE OpenCVProcessor instead of an untyped Node (see its declaration there).
+	if _diagnostics != null:
+		_diagnostics.configure(_head_locator, _xr_api, _play_space_to_world, xr_camera, xr_origin)
 	if debug_prints_enabled:
 		print("[opencv_aruco] [aruco::_setup_xr_locator] head locator created: use_xr_locate_space=%s (validation prints once a second while debug is on)" % use_xr_locate_space)
 
@@ -667,7 +596,7 @@ func _on_android_camera_frame(timestamp_ns: int, data: PackedByteArray, width: i
 
 	# debug output (grayscale): preview overlay. The TCP streamer is NOT fed here -- it sends the
 	# frame together with that frame's detected corners, which only exist once the worker is done
-	# (see _stream_detected_frame).
+	# (see TcpDebugStream.submit).
 	if cam_preview.visible:
 		if _preview_texture == null:
 			_preview_texture = ImageTexture.create_from_image(img)
@@ -685,12 +614,6 @@ func _tracing(frame_id: int) -> bool:
 
 ####################################################################################################
 func _process(_delta: float) -> void:
-	_poll_tcp(_delta)
-	# Ticked here rather than beside a send site: the debug frame goes out from
-	# _poll_detection_task, which the early returns further down never reach (and on the Android
-	# path _process does not see the frames at all).
-	_tcp_send_timer += _delta
-
 	# Head-pose history: one [t_usec, pose] sample per rendered frame, so a finished detection can
 	# be baked with the pose the head actually had at the frame's capture time (see _head_pose_at).
 	#
@@ -704,7 +627,7 @@ func _process(_delta: float) -> void:
 	# The camera's sensor timestamp is mapped onto Godot ticks with the same monotonic offset
 	# (see _resample_clock_offsets), so an error in that offset cancels here instead of biasing.
 	var now_usec := Time.get_ticks_usec()
-	# Read once per frame and shared with the locate check further down, which needs the same pdt
+	# Read once per frame and handed to the diagnostics below, whose locate check needs the same pdt
 	# to compare against the same head pose. _xr_api is null exactly when there is no OpenXR, so
 	# this never touches a dead singleton.
 	var pdt := _xr_api.get_predicted_display_time() if _xr_api != null else 0
@@ -718,68 +641,18 @@ func _process(_delta: float) -> void:
 	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < pose_usec - 500_000:
 		_xr_cam_pose_history.pop_front()
 
-	# Health check for the stamping above: it is only valid if the pdt read this frame belongs to
-	# the pose read beside it, i.e. if pdt advances exactly once per _process. When it does, the
-	# summed pdt deltas over any window equal the summed wall-clock deltas, because both telescope
-	# to (last - first):
-	#   ratio ~ 1.00, dupes = 0   -> lockstep, stamping is sound
-	#   dupes > 0, ratio < 1      -> pdt repeats across _process calls; it is stale on those
-	#                                frames and the stamps carry a VARIABLE error
-	#   ratio > 1                 -> pdt skips ahead of the main loop
-	# Per-line ratio scatter of a few percent is expected and benign: it is exactly the lead's
-	# drift across that window divided by the window length, not a desync. pdt_delta_ms should
-	# land on integer multiples of the display period (13.89ms at 72Hz), the minimum being one.
-	# NOTE this cannot detect a CONSTANT one-frame stagger -- that keeps ratio at 1.00 with no
-	# dupes, hiding entirely in the absolute offset. It rules out the variable failure only; the
-	# constant residual is what POSE_LOOKUP_TRIM_MS is for.
-	# Only on the Android plugin path with a monotonic offset; skipped entirely on desktop.
-	if debug_prints_enabled and _xr_stamp_poses and not _cam_ts_realtime:
-		if pdt != 0:
-			# The very first frame only seeds the reference; every later frame contributes one delta.
-			if _pdt_prev != 0:
-				var d_pdt_ns := pdt - _pdt_prev
-				var lead_ms := float(pdt - (now_usec * 1000 + _xr_clock_offset_ns)) / 1.0e6
-				if _pdt_deltas == 0:      # first delta of a fresh window seeds the extremes
-					_pdt_delta_min_ns = d_pdt_ns
-					_pdt_delta_max_ns = d_pdt_ns
-					_lead_min_ms = lead_ms
-					_lead_max_ms = lead_ms
-				else:
-					_pdt_delta_min_ns = mini(_pdt_delta_min_ns, d_pdt_ns)
-					_pdt_delta_max_ns = maxi(_pdt_delta_max_ns, d_pdt_ns)
-					_lead_min_ms = minf(_lead_min_ms, lead_ms)
-					_lead_max_ms = maxf(_lead_max_ms, lead_ms)
-				if d_pdt_ns == 0:
-					_pdt_dupes += 1
-				_pdt_deltas += 1
-				_pdt_advance_ns += d_pdt_ns
-				_pdt_wall_advance_usec += now_usec - _pdt_prev_now_usec
-				_lead_sum_ms += lead_ms
-			_pdt_prev = pdt
-			_pdt_prev_now_usec = now_usec
-
-		_lead_print_timer += _delta
-		if _lead_print_timer >= 1.0 and _pdt_deltas > 0 and _pdt_wall_advance_usec > 0:
-			_lead_print_timer = 0.0
-			print("[opencv_aruco] [aruco::_process] openxr pdt sync: frames=%d dupes=%d ratio=%.4f pdt_delta_ms=%.2f..%.2f lead_ms=%.2f (%.2f..%.2f)" % [
-					_pdt_deltas, _pdt_dupes,
-					float(_pdt_advance_ns) / float(_pdt_wall_advance_usec * 1000),
-					_pdt_delta_min_ns / 1.0e6, _pdt_delta_max_ns / 1.0e6,
-					_lead_sum_ms / _pdt_deltas, _lead_min_ms, _lead_max_ms])
-			_pdt_deltas = 0
-			_pdt_dupes = 0
-			_pdt_advance_ns = 0
-			_pdt_wall_advance_usec = 0
-			_lead_sum_ms = 0.0
-
-	# Device validation for the xrLocateSpace switch. Its own timer and its own condition, NOT
-	# folded into the pdt block above: this is what decides whether use_xr_locate_space may be
-	# turned on, so it has to keep working on a deploy where the pdt stamping is off.
-	if debug_prints_enabled and _head_locator != null:
-		_locate_check_timer += _delta
-		if _locate_check_timer >= 1.0:
-			_locate_check_timer = 0.0
-			_check_xr_locate(pdt)
+	# Health check for the stamping above (is pdt in lockstep with _process?) plus the once-a-second
+	# xrLocateSpace device probes -- both live on the DetectionDiagnostics child, which owns their
+	# timers, accumulators and the "openxr pdt sync" / "openxr locate check" lines.
+	# Everything they need is handed over per frame rather than read back out of this node, above all
+	# _xr_clock_offset_ns: it is resampled here (_resample_clock_offsets), and a second copy over
+	# there could drift from the one the pose lookup actually uses -- which is the exact class of
+	# error the check exists to catch. The pdt statistics are only meaningful while the history is
+	# genuinely pdt-stamped, which is what the fourth argument says; the locate probes have their own
+	# condition and keep running either way.
+	if _diagnostics != null:
+		_diagnostics.sample(pdt, now_usec, _xr_clock_offset_ns,
+				_xr_stamp_poses and not _cam_ts_realtime, _delta)
 
 	# (a) Collect the latest finished detection and bake it into the scene (main thread ->
 	# scene-tree writes are safe here); also re-fills the task slot from the pending frame.
@@ -840,9 +713,11 @@ func _poll_detection_task() -> void:
 	_detect_task_id = -1
 	_apply_detection_result()
 	# Only now do the frame and its corners both exist, so this is the earliest point at which the
-	# overlay can be streamed as one consistent pair -- and it has to happen BEFORE the pending
-	# frame below is handed on, since that overwrites _stream_img with the next frame.
-	_stream_detected_frame()
+	# overlay can be streamed as one consistent pair -- and it has to happen BEFORE the pending frame
+	# below is handed on, since that overwrites _detecting_img with the next frame. Passing the image
+	# as an argument is what makes that ordering safe rather than merely documented.
+	if _debug_stream != null:
+		_debug_stream.submit(_detecting_img, _result_corners, _result_markers, _result_cam_xform)
 	if _has_pending:
 		var img := _pending_image
 		var capture_usec := _pending_capture_usec
@@ -861,9 +736,9 @@ func _start_detection_task(img: Image, capture_usec: int, cam_xform: Transform3D
 	# _poll_detection_task -- come through here. (It no longer has to happen here for thread-safety;
 	# the table this used to rebuild lives in C++ now and is resolved per detection.)
 	_sync_marker_sizes()
-	# Held for the debug streamer: _poll_detection_task sends THIS frame once the task below has
+	# Held so _poll_detection_task can hand THIS frame to the debug streamer once the task below has
 	# produced the corners that belong to it.
-	_stream_img = img
+	_detecting_img = img
 	_detect_task_id = WorkerThreadPool.add_task(_detect_frame.bind(img, capture_usec, cam_xform, frame_id),
 			false, "opencv_aruco marker detection")
 
@@ -898,124 +773,9 @@ func _get_or_create_patch(id: int) -> Node3D:
 # Apply the finished detection (main thread only). The markers come back from the C++ side
 # already in WORLD space -- baked with the head pose at the frame's capture time, which
 # travelled with the frame -- so applying is a plain assignment.
-# Row-major 3x4 [R | t], so numpy reshapes it straight into a pose matrix. Godot's Basis stores
-# its x/y/z as COLUMNS (basis.x == get_column(0) == the image of the local X axis), so the rows
-# written here are built component-wise rather than by dumping basis.x/y/z in order -- doing that
-# would silently transpose every rotation and the solve would converge on nonsense.
-func _xform_to_array(t: Transform3D) -> Array:
-	return [
-		t.basis.x.x, t.basis.y.x, t.basis.z.x, t.origin.x,
-		t.basis.x.y, t.basis.y.y, t.basis.z.y, t.origin.y,
-		t.basis.x.z, t.basis.y.z, t.basis.z.z, t.origin.z,
-	]
-
-
-# One JSONL line per (frame, marker): the head pose in WORLD space and that marker's pose in RAW
-# CAMERA space. Main thread only, called from _apply_detection_result -- the worker never touches
-# any of this.
-# Two things invalidate a capture run, and neither is detectable from the data afterwards:
-# the marker must not MOVE (the whole constraint is that its world pose is constant), and the
-# reference frame must not shift under you -- no XRServer.center_on_hmd(), no moving XROrigin3D,
-# since the head poses are logged in world space.
-func _handeye_record(head: Transform3D, markers: Dictionary) -> void:
-	if markers.is_empty() or _handeye_kept >= HANDEYE_MAX_SAMPLES:
-		return
-	if _handeye_has_last:
-		var moved_deg := rad_to_deg(head.basis.get_rotation_quaternion().angle_to(
-				_handeye_last_xform.basis.get_rotation_quaternion()))
-		var moved_m := head.origin.distance_to(_handeye_last_xform.origin)
-		if moved_deg < HANDEYE_MIN_ROT_DEG and moved_m < HANDEYE_MIN_POS_M:
-			return
-	# Opened lazily, on the first kept sample: with the flag off this function costs one bool test
-	# per detection and never touches the filesystem.
-	if _handeye_file == null:
-		_handeye_file = FileAccess.open(HANDEYE_PATH, FileAccess.WRITE)
-		if _handeye_file == null:
-			push_error("[opencv_aruco] [aruco::_handeye_record] cannot open %s: err=%d (capture disabled)" % [
-					HANDEYE_PATH, FileAccess.get_open_error()])
-			handeye_capture = false
-			return
-		print("[opencv_aruco] [aruco::_handeye_record] handeye capture started: path=%s" % ProjectSettings.globalize_path(HANDEYE_PATH))
-	# Exactly the pose the C++ pre-multiplied onto every solvePnP result, so inverting it undoes
-	# that one step and nothing else -- what comes back is the raw camera-space marker pose,
-	# independent of whatever lens pose is currently configured. That independence is the point: the
-	# samples stay valid even if the lens pose is edited between capture and solve. get_lens_pose()
-	# reads the same decoded transform the detection used, so the two cannot drift apart.
-	var inv := (head * get_lens_pose()).affine_inverse()
-	for id in markers:
-		_handeye_file.store_line(JSON.stringify({
-			"id": id,
-			"head": _xform_to_array(head),
-			"marker_cam": _xform_to_array(inv * markers[id]),
-		}))
-	# Flushed per sample because a Quest session ends with `adb shell am force-stop`, which gives
-	# the app no chance to close anything -- an unflushed buffer would take the run with it.
-	_handeye_file.flush()
-	_handeye_kept += 1
-	_handeye_last_xform = head
-	_handeye_has_last = true
-	if _handeye_kept % 25 == 0:
-		print("[opencv_aruco] [aruco::_handeye_record] handeye samples=%d/%d (vary head pitch AND yaw; rotation is what constrains the solve)" % [
-				_handeye_kept, HANDEYE_MAX_SAMPLES])
-
-
-# id -> [world position, head rotation] as of the FIRST detection of that id. Reference point for the
-# drift readout in _apply_detection_result, which exists to answer one question the rest of the
-# pipeline cannot: when the mesh appears to slide against a stationary marker, is the world ESTIMATE
-# moving, or only its apparent alignment? Passthrough is a reprojected image, not optical see-through,
-# so a pose that is rock steady in world space can still look like it slides as the head turns --
-# and no amount of lens-pose work touches that. Comparing the estimate against itself takes the
-# passthrough out of the loop entirely.
-# Never cleared, so the reference survives a dropout and the drift stays comparable across the whole
-# session; bounded by the marker count, same as _marker_poses.
-var _drift_ref: Dictionary = {}
-# id -> the world positions seen so far while the reference is still forming; dropped once it locks.
-var _drift_seed: Dictionary = {}
-# id -> head rotation at the FIRST detection. head_deg is measured from this, and it is deliberately
-# the first sample rather than a median: it is an angle datum, not a noisy measurement, and the head
-# is held still while the reference forms anyway.
-var _drift_rot: Dictionary = {}
-# How many detections the position reference is averaged over before it locks. Seeding from ONE
-# detection makes every later drift_mm hostage to that sample's noise -- measured on device the
-# per-frame position jitter is ~2.5mm peak-to-peak, so a lone outlier at seeding time offsets the
-# whole session by a constant and reads exactly like a real standing error. ~1.5s of detections.
-const DRIFT_REF_SAMPLES := 20
-
-
-# Component-wise median of the seed window for `id`, recomputed until the window fills and then
-# frozen. Median rather than mean so a single bad detection during seeding cannot drag the datum.
-func _drift_reference_pos(id: int, pos: Vector3) -> Vector3:
-	if _drift_ref.has(id):
-		return _drift_ref[id]
-	var seed: Array = _drift_seed.get(id, [])
-	seed.append(pos)
-	_drift_seed[id] = seed
-	var xs: Array = []
-	var ys: Array = []
-	var zs: Array = []
-	for p in seed:
-		xs.append(p.x)
-		ys.append(p.y)
-		zs.append(p.z)
-	xs.sort()
-	ys.sort()
-	zs.sort()
-	var mid: int = seed.size() / 2
-	var med := Vector3(xs[mid], ys[mid], zs[mid])
-	if seed.size() >= DRIFT_REF_SAMPLES:
-		_drift_ref[id] = med           # locked; the seed window is dead weight from here on
-		_drift_seed.erase(id)
-	return med
-
-
 func _apply_detection_result() -> void:
 	var markers: Dictionary = _result_markers
 	var result_id: int = _result_frame_id
-	if handeye_capture:
-		# _result_cam_xform is the head pose the markers were actually baked with, i.e. the pose at
-		# CAPTURE time rather than the live one -- the same pairing the live path uses, so a
-		# calibration solved from these samples is valid for it.
-		_handeye_record(_result_cam_xform, markers)
 	if _tracing(result_id):
 		print("[opencv_aruco] [aruco::_apply_detection_result] flow #%d (8) applying result: capture_usec=%d result_age_ms=%.1f markers=%d" % [
 				result_id, _result_capture_usec,
@@ -1037,37 +797,20 @@ func _apply_detection_result() -> void:
 		_get_or_create_patch(id).global_transform = markers[id]
 		_marker_last_seen[id] = now_usec
 		seen_ids.append(id)
-		# How far this marker's WORLD estimate has wandered from where it was first seen, against how
-		# far the head has turned since. The marker does not move, so every millimetre of drift_mm is
-		# error -- and the correlation is the diagnosis:
-		#   drift_mm grows with head_deg -> the error is conjugated by the head transform, i.e. it
-		#     lives in the lens pose or the head pose, and calibration is the fix.
-		#   drift_mm stays flat while head_deg swings -> the pose chain is solid and what you SEE
-		#     moving is the render against passthrough's reprojection, which calibration cannot touch.
-		# dist_m is printed because it separates the two halves of a lens-pose error: a ROTATIONAL one
-		# scales with it, a TRANSLATIONAL one does not. The hand-eye capture spanned only 0.51-0.60m,
-		# so that split is the least-constrained thing in the current calibration -- watch drift_mm as
-		# you walk toward and away from a marker, not just as you turn your head.
-		# Gated on debug_prints_enabled rather than _tracing(): this needs EVERY detection to be
-		# readable as a sweep, not one frame in DEBUG_FLOW_EVERY.
-		if debug_prints_enabled:
-			var head_rot := _result_cam_xform.basis.get_rotation_quaternion()
-			if not _drift_rot.has(id):
-				_drift_rot[id] = head_rot
-			var ref_pos := _drift_reference_pos(id, markers[id].origin)
-			var ref_rot: Quaternion = _drift_rot[id]
-			# Lines still marked SEEDING have a reference that is still moving under them, so their
-			# drift_mm is not comparable with the rest -- drop them before reading the sweep.
-			print("[opencv_aruco] [aruco::_apply_detection_result] marker drift: id=%d drift_mm=%.1f head_deg=%.1f dist_m=%.2f world_pos=%v%s" % [
-					id, (markers[id].origin - ref_pos).length() * 1000.0,
-					rad_to_deg(head_rot.angle_to(ref_rot)),
-					_result_cam_xform.origin.distance_to(markers[id].origin),
-					markers[id].origin,
-					"" if _drift_ref.has(id) else " SEEDING"])
 		if _tracing(result_id):
 			# frozen at this world pose until the next detection
 			print("[opencv_aruco] [aruco::_apply_detection_result] flow #%d (10) marker assigned: id=%d world_pos=%v" % [
 					result_id, id, markers[id].origin])
+
+	# The measurement apparatus, fed once with this detection: the hand-eye capture writes the pair
+	# to disk, the drift readout compares each marker against where it was first seen. Both want the
+	# same two values, hence one call -- and _result_cam_xform rather than the live head pose,
+	# because that is what the markers were actually baked with (the pose at CAPTURE time), so a
+	# calibration solved from these samples is valid for the live path.
+	# AFTER the loop above, so anything reading back through the public API sees poses that are
+	# already applied; before the prune, which only touches nodes.
+	if _diagnostics != null:
+		_diagnostics.submit(_result_cam_xform, markers)
 
 	# Drop patches whose marker has been missing for longer than the grace period. Pruning runs
 	# HERE, on a fresh detection result, not on a timer: absence is only evidence that a marker is
@@ -1160,101 +903,16 @@ func _head_pose_at(t_usec: int) -> Transform3D:
 # OpenXR play space -> world. The locator returns the head relative to the PLAY space, which is
 # what XROrigin3D stands for -- but XRCamera3D's own transform additionally carries XRServer's
 # reference frame (whatever center_on_hmd() last set) and the world scale. Reapplying both here is
-# what makes check (A) below a test of the TIME argument rather than of this conversion; with an
-# untouched XROrigin3D, no recentering and world_scale 1 all three factors are identity, so this
-# costs nothing today and stops the poses drifting off the moment locomotion or scaling appears.
+# what makes check (A) on the DetectionDiagnostics node a test of the TIME argument rather than of
+# this conversion -- which is why that node is handed THIS function as a Callable instead of keeping
+# a copy of it. With an untouched XROrigin3D, no recentering and world_scale 1 all three factors are
+# identity, so this costs nothing today and stops the poses drifting off the moment locomotion or
+# scaling appears.
+# Stays here rather than moving with the checks: the LIVE locate path in _on_android_camera_frame
+# converts every frame's pose with it.
 func _play_space_to_world(head: Transform3D) -> Transform3D:
 	var scaled := Transform3D(head.basis, head.origin * XRServer.world_scale)
 	return xr_origin.global_transform * XRServer.get_reference_frame() * scaled
-
-
-# One probe: head pose at xr_time, expressed in world space and compared against `live`. Returns
-# the two scalars the checks below print, or just valid=false if the runtime would not answer.
-# Factored out because the whole point of the check is comparing the SAME measurement at three
-# different times -- doing that inline three times invites the three copies drifting apart.
-func _locate_delta(xr_time: int, live: Transform3D) -> Dictionary:
-	var loc: Dictionary = _head_locator.locate_head(xr_time)
-	if not loc.get("valid", false):
-		return {"valid": false, "result": loc["result"], "flags": loc["flags"]}
-	var raw: Transform3D = loc["transform"]
-	var pose := _play_space_to_world(raw)
-	return {
-		"valid": true,
-		"tracked": loc["tracked"],
-		"flags": loc["flags"],
-		"pos_mm": pose.origin.distance_to(live.origin) * 1000.0,
-		"rot_deg": rad_to_deg(pose.basis.get_rotation_quaternion().angle_to(live.basis.get_rotation_quaternion())),
-		# The play-space pose exactly as the runtime gave it, before any conversion -- see the
-		# raw diagnostic line below.
-		"ps_origin": raw.origin,
-	}
-
-
-# Once-a-second device check for the xrLocateSpace path (debug prints only). MOVE YOUR HEAD while
-# reading it -- every number below is a difference between two head poses, so standing still makes
-# all of them zero and proves nothing.
-#
-#   (A) Which instant does XRCamera3D's pose actually describe, and does our conversion reproduce
-#       it? Probed at BOTH times OpenXR offers -- get_predicted_display_time() and
-#       get_next_frame_time() (= pdt + one display period) -- because Godot could plausibly use
-#       either: it samples the head pose in the main loop, and whether that happens before or
-#       after the frame's xrWaitFrame decides which one is current. Whichever comes back at ~0 is
-#       the one XRCamera3D belongs to; the other sits a display period of head motion away.
-#       MEASURED ON DEVICE: pdt wins, by a wide margin -- it reproduces XRCamera3D to 0.02-0.3mm
-#       (often bit-for-bit) while one display period is worth ~7mm at normal head speed. So the
-#       pdt-stamped history carries NO one-frame stagger, and that suspicion can come off
-#       POSE_LOOKUP_TRIM_MS's list; what is left for it is start-vs-middle of exposure.
-#       If NEITHER probe is near zero, the VIEW space or _play_space_to_world is wrong and
-#       nothing else here means anything until that is fixed.
-#   (B) Does this runtime answer for times in the PAST? That is the entire premise of the switch:
-#       a camera frame is 30-60ms old by the time it arrives. valid=true at
-#       pdt - LOCATE_PAST_PROBE_MS says yes, and pos_mm/rot_deg then show how far the head
-#       travelled over that interval -- which is exactly the error the history path has to cover
-#       with predicted poses. MEASURED: valid, tracked, and 1-31mm of movement over the 60ms.
-#       valid=false would mean the runtime will not serve history: turn use_xr_locate_space off.
-func _check_xr_locate(pdt: int) -> void:
-	if pdt == 0:
-		print("[opencv_aruco] [aruco::_check_xr_locate] openxr locate check: no predicted display time yet")
-		return
-	if not _head_locator.is_ready():
-		print("[opencv_aruco] [aruco::_check_xr_locate] openxr locate check: locator not ready (no session or play space yet)")
-		return
-
-	# Read once, so all three probes are compared against the same reference pose.
-	var live := xr_camera.global_transform
-	var next_time: int = _xr_api.get_next_frame_time()
-
-	var at_pdt := _locate_delta(pdt, live)
-	var at_next := _locate_delta(next_time, live)
-	print("[opencv_aruco] [aruco::_check_xr_locate] openxr locate check (A) vs XRCamera3D: pdt=%s next_frame=%s gap_ms=%.2f (MOVE YOUR HEAD; the one at ~0 is the time XRCamera3D's pose belongs to)" % [
-			_fmt_locate(at_pdt), _fmt_locate(at_next), (next_time - pdt) / 1.0e6])
-
-	var in_past := _locate_delta(pdt - int(LOCATE_PAST_PROBE_MS * 1.0e6), live)
-	print("[opencv_aruco] [aruco::_check_xr_locate] openxr locate check (B) at pdt-%.0fms: %s (valid => historical queries work, and the offsets are the motion over that interval)" % [
-			LOCATE_PAST_PROBE_MS, _fmt_locate(in_past)])
-
-	# Raw values, because the two lines above only ever show DIFFERENCES -- and a difference of
-	# "head height" looks the same whether the located pose is wrong or simply absent (which is
-	# exactly how the transform_from_pose() bug first presented).
-	#   ps == cam_local            -> the pose and the whole conversion are right
-	#   ps=(0,0,0) with valid=true -> the runtime did not write our XrSpaceLocation
-	# ps_move is the premise in one number: the play-space origin at pdt against the one 60ms
-	# earlier. Exactly 0.00 while your head is moving would mean the runtime ignores `time` and
-	# the switch is worthless; measured here it runs 1-31mm, i.e. historical queries work.
-	if at_pdt["valid"] and in_past["valid"]:
-		print("[opencv_aruco] [aruco::_check_xr_locate] openxr locate raw: ps=%v cam_local=%v cam_world=%v origin=%v ref=%v scale=%.2f ps_move_mm=%.2f" % [
-				at_pdt["ps_origin"],
-				xr_camera.transform.origin, live.origin,
-				xr_origin.global_transform.origin, XRServer.get_reference_frame().origin,
-				XRServer.world_scale,
-				at_pdt["ps_origin"].distance_to(in_past["ps_origin"]) * 1000.0])
-
-
-func _fmt_locate(d: Dictionary) -> String:
-	if not d["valid"]:
-		return "INVALID(result=%d flags=%d)" % [d["result"], d["flags"]]
-	return "[pos_mm=%.2f rot_deg=%.3f tracked=%s]" % [d["pos_mm"], d["rot_deg"], d["tracked"]]
-
 
 
 func _exit_tree() -> void:
@@ -1262,235 +920,11 @@ func _exit_tree() -> void:
 		android_camera.stop_camera()
 	# A detection task may still be running on the pool; block until it is done so its bound
 	# callable (which captures self) doesn't outlive the scene. Costs at most one detection (~80ms).
+	# Nothing else to tidy: the hand-eye file went with the DetectionDiagnostics node, which closes
+	# it from its own _exit_tree.
 	if _detect_task_id != -1:
 		WorkerThreadPool.wait_for_task_completion(_detect_task_id)
 		_detect_task_id = -1
-	# Closed AFTER the task drain above, so a detection finishing during teardown cannot write into
-	# a closed handle. Every sample is already flushed, so this only tidies up on a clean exit --
-	# a force-stop skips it and loses nothing.
-	if _handeye_file != null:
-		_handeye_file.close()
-		_handeye_file = null
-		print("[opencv_aruco] [aruco::_exit_tree] handeye capture closed: samples=%d path=%s" % [
-				_handeye_kept, ProjectSettings.globalize_path(HANDEYE_PATH)])
 
-# Send the last detected frame plus its corners, at most every TCP_SEND_INTERVAL. Called from
-# _poll_detection_task, i.e. once per finished detection (~12/s on Quest) rather than once per
-# camera frame -- the interval only throttles further, it can no longer force a send.
-func _stream_detected_frame() -> void:
-	if _stream_img == null:
-		return
-	if _tcp_send_timer < TCP_SEND_INTERVAL:
-		return
-	_tcp_send_timer = 0.0
-	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
-		# Second overlay: the world poses latched up to REPROJ_BASELINE_MS ago, projected into THIS
-		# frame. Deliberately cross-frame. Reprojecting a frame's own poses with its own head pose
-		# cancels algebraically -- the C++ multiplied by head_pose * lens_pose and
-		# project_marker_corners divides by it again, leaving M_1 exactly -- so it would draw a
-		# perfect square however wrong lens_pose is. Only a head pose that has CHANGED since the
-		# latch makes lens_pose stop cancelling, which is why the head has to move for this to mean
-		# anything and why the baseline angle travels with the frame.
-		var reproj := project_marker_corners(_prev_stream_poses, _result_cam_xform)
-		# How far the head has moved since the reference was latched -- measured against the
-		# reference that produced `reproj`, so both have to be read BEFORE the re-latch below. Zero
-		# while there is no reference yet, where the identity placeholder would otherwise report the
-		# head's absolute pose as if it were a baseline.
-		#
-		# BOTH numbers travel, because they drive DIFFERENT errors and neither substitutes for the
-		# other. Turning the head is what makes a lens_translation error show up. Strafing cannot:
-		# with the head orientation fixed the relative motion A is a pure translation and
-		# L^-1 A L = [I | R_L^T d], in which t_L has cancelled out entirely. What a strafe does
-		# reveal is anything that puts the marker at the wrong DEPTH -- a wrong aruco_patch_size or
-		# focal length -- because parallax against a wrongly-placed point grows with viewpoint
-		# change, plus a lens_rotation error through the surviving R_L.
-		var baseline_deg := 0.0
-		var baseline_m := 0.0
-		if not _prev_stream_poses.is_empty():
-			baseline_deg = rad_to_deg(_result_cam_xform.basis.get_rotation_quaternion().angle_to(
-					_prev_stream_xform.basis.get_rotation_quaternion()))
-			baseline_m = _result_cam_xform.origin.distance_to(_prev_stream_xform.origin)
-		var now_ms := Time.get_ticks_msec()
-		if _prev_stream_poses.is_empty() or now_ms - _prev_stream_ms >= REPROJ_BASELINE_MS:
-			_prev_stream_poses = _result_markers.duplicate()
-			_prev_stream_xform = _result_cam_xform
-			_prev_stream_ms = now_ms
-		_send_frame_tcp(_stream_img, _result_corners, reproj, baseline_deg, baseline_m)
-
-
-# Buffers one frame for the debug streamer and pushes what fits right now. Never blocks; drops the
-# frame outright while the previous one is still on its way out (see _tcp_out).
-#
-# Wire format, big-endian throughout, consumed by tools/tcp_receiver.py:
-#   header:  width u32, height u32, image_format u32, payload_size u32      (16 bytes)
-#   payload: payload_size raw Image bytes
-#   markers: marker_count u32, then per marker id u32 + 8 f32               (36 bytes each)
-#            = the 4 corners as x0,y0,..,x3,y3 in the payload's own pixel space.
-#   reproj:  a SECOND block in exactly the same layout -- the latched world poses projected back
-#            into this frame (see _stream_detected_frame for what it tests).
-#   trailer: baseline_deg f32, baseline_m f32 = how far the head has turned and moved since those
-#            poses were latched. Without them the pixel gap the receiver prints is uninterpretable:
-#            the gap scales with the baseline and is zero at zero, so "0.4px" means "calibrated"
-#            after 50deg of turning and means "you stood still" after 2deg. Both are sent because
-#            they drive different errors -- turning exposes lens_translation, strafing exposes
-#            marker size / focal length (see _stream_detected_frame).
-# The extra blocks are APPENDED after the image so the original 16-byte header stayed as it was, and
-# all of them are always written, count 0 included: the receiver reads a fixed structure per frame,
-# so an omitted block would desync every frame after it. Sender and receiver therefore have to be
-# updated together -- an older tcp_receiver.py reads this frame's tail as the next frame's header.
-# Corner count per marker is fixed at 4 (guaranteed by the C++ side), hence no per-marker length.
-# It is built into the SAME buffer as header and payload, not written to the socket separately:
-# _tcp_out drains asynchronously, so anything put on the socket by hand would overtake the pixels
-# still queued in front of it. Being one buffer also makes a dropped frame drop its markers with
-# it -- the receiver reads a fixed number of bytes per frame, so a half-sent pair would desync
-# every following frame too.
-func _send_frame_tcp(img: Image, corners: Dictionary, reproj: Dictionary, baseline_deg: float,
-		baseline_m: float) -> void:
-	if stream_peer == null:
-		return
-
-	stream_peer.poll()
-
-	if stream_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
-		return
-
-	if not _tcp_out.is_empty():
-		_tcp_dropped += 1
-		if debug_prints_enabled and _tcp_dropped % 100 == 0:
-			print("[opencv_aruco] [aruco::_send_frame_tcp] receiver behind: dropped=%d backlog=%d bytes" % [
-					_tcp_dropped, _tcp_out.size()])
-		return
-
-	var bytes: PackedByteArray = img.get_data()
-
-	# 16-byte header, big-endian: width, height, Image.Format, payload size (tools/tcp_receiver.py).
-	# Written by hand rather than via put_u32 because header and payload have to reach the buffer as
-	# one block -- a partially written header would desync the receiver for good.
-	var frame := PackedByteArray()
-	frame.append_array(_be_u32(img.get_width()))
-	frame.append_array(_be_u32(img.get_height()))
-	frame.append_array(_be_u32(img.get_format()))
-	frame.append_array(_be_u32(bytes.size()))
-	frame.append_array(bytes)
-
-	frame.append_array(_marker_block(corners))
-	frame.append_array(_marker_block(reproj))
-	frame.append_array(_be_f32(baseline_deg))
-	frame.append_array(_be_f32(baseline_m))
-
-	_tcp_out = frame
-	_flush_tcp()
-
-
-# One marker block: count u32, then id u32 + 8 big-endian f32 per marker. Two of these go out per
-# frame (detected corners first, then reprojected ones) and the receiver reads them with the same
-# function, so the layout is factored out here rather than written twice.
-func _marker_block(markers: Dictionary) -> PackedByteArray:
-	var block := PackedByteArray()
-	block.append_array(_be_u32(markers.size()))
-	for id in markers:
-		block.append_array(_be_u32(id))
-		var pts: PackedVector2Array = markers[id]
-		for p in pts:
-			block.append_array(_be_f32(p.x))
-			block.append_array(_be_f32(p.y))
-	return block
-
-
-func _be_u32(value: int) -> PackedByteArray:
-	return PackedByteArray([
-			(value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-
-
-# IEEE 754 single, big-endian. encode_float writes little-endian, and the buffer is exactly the
-# four bytes of that one value, so reversing it IS the byte swap.
-func _be_f32(value: float) -> PackedByteArray:
-	var b := PackedByteArray()
-	b.resize(4)
-	b.encode_float(0, value)
-	b.reverse()
-	return b
-
-
-# Hands the socket as much of the buffered frame as it will take without waiting. Called once per
-# _process from _poll_tcp and again right after buffering, so a frame that fits leaves the same frame.
-func _flush_tcp() -> void:
-	if _tcp_out.is_empty() or stream_peer == null:
-		return
-
-	var res: Array = stream_peer.put_partial_data(_tcp_out)
-	var err: int = res[0]
-	var sent: int = res[1]
-
-	if err != OK:
-		push_error("[opencv_aruco] [aruco::_flush_tcp] put_partial_data failed: err=%d" % err)
-		_tcp_out.clear()
-		return
-
-	if sent >= _tcp_out.size():
-		_tcp_out.clear()
-	elif sent > 0:
-		_tcp_out = _tcp_out.slice(sent)
-
-func _connect_tcp() -> void:
-	stream_peer = StreamPeerTCP.new()
-	stream_peer.big_endian = true
-
-	var err := stream_peer.connect_to_host(TCP_HOST, TCP_PORT)
-	if debug_prints_enabled:
-		print("[opencv_aruco] [aruco::_connect_tcp] connect_to_host: err=%d" % err)
-
-
-# Drop the socket and everything that belongs to it. The half-sent frame goes too: a later
-# reconnect has to start at a header boundary or the receiver is desynced for good (same reason
-# _poll_tcp clears it on an error). _last_tcp_status is reset so the next connection logs its
-# transitions from scratch instead of silently matching the stale value.
-func _close_tcp() -> void:
-	stream_peer.disconnect_from_host()
-	stream_peer = null
-	_tcp_out.clear()
-	_last_tcp_status = -1
-	_tcp_reconnect_timer = 0.0
-	if debug_prints_enabled:
-		print("[opencv_aruco] [aruco::_close_tcp] stream closed: dropped_frames=%d" % _tcp_dropped)
-
-
-func _poll_tcp(delta: float) -> void:
-	# The one place the socket is reconciled against tcp_stream_enabled, in both directions.
-	if not tcp_stream_enabled:
-		if stream_peer != null:
-			_close_tcp()
-		return
-
-	if stream_peer == null:
-		_connect_tcp()
-		return
-
-	stream_peer.poll()
-
-	var status := stream_peer.get_status()
-
-	if status != _last_tcp_status:
-		if debug_prints_enabled:
-			print("[opencv_aruco] [aruco::_poll_tcp] status changed: from=%d to=%d" % [_last_tcp_status, status])
-		_last_tcp_status = status
-
-	if status == StreamPeerTCP.STATUS_CONNECTED:
-		_tcp_reconnect_timer = 0.0
-		_flush_tcp()
-		return
-
-	if status == StreamPeerTCP.STATUS_CONNECTING:
-		return
-
-	if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
-		# The half-sent frame belongs to the dead socket; a reconnect starts at a header boundary.
-		_tcp_out.clear()
-		_tcp_reconnect_timer += delta
-		if _tcp_reconnect_timer >= 1.0:
-			_tcp_reconnect_timer = 0.0
-			if debug_prints_enabled:
-				print("[opencv_aruco] [aruco::_poll_tcp] reconnecting")
-			_connect_tcp()
 #command to stop (once adb is added to PATH)
 # adb shell am force-stop de.unigreifswald.opencvaruco

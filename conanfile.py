@@ -23,8 +23,16 @@ class GdextensionOpenCV(ConanFile):
         # Module, die OpenCVProcessor wirklich nutzt
         "opencv/*:objdetect": True,   # cv::aruco::ArucoDetector
         "opencv/*:calib3d": True,     # solvePnP / Rodrigues
-        "opencv/*:imgcodecs": True,   # imread
-        "opencv/*:videoio": True,     # VideoCapture (Webcam, macOS -> AVFoundation)
+        # ACHTUNG, seit 2026-08 nicht mehr zutreffend begruendet: imgcodecs stand hier fuer imread,
+        # videoio fuer VideoCapture -- beide Aufrufer (get_6dof_of_all_aruco_patches_from_picture /
+        # ..._from_webcam) sind geloescht, und im ganzen src/ ruft nichts mehr imread oder
+        # VideoCapture auf. Beide koennen vermutlich auf False; das spart Buildzeit und nimmt dem
+        # Android-.so das DT_NEEDED auf libmediandk (das ueber videoios cpp_info hereinkommt, siehe
+        # SConstruct). ABSICHTLICH NOCH TRUE: ein Umlegen erzwingt einen kompletten
+        # OpenCV-From-Source-Rebuild (~10-20 min), also eine bewusste Entscheidung, kein
+        # Nebeneffekt eines Aufraeumcommits.
+        "opencv/*:imgcodecs": True,   # frueher: imread
+        "opencv/*:videoio": True,     # frueher: VideoCapture (Webcam, macOS -> AVFoundation)
         # Ungenutzte / schwere Module + grosse externe Deps abschalten,
         # damit der From-Source-Build kleiner und schneller wird.
         "opencv/*:dnn": False,

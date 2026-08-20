@@ -2,6 +2,8 @@
 
 [ext_resource type="Script" uid="uid://df20bwxeyvlj4" path="res://xr_startup.gd" id="1_2fw1a"]
 [ext_resource type="Script" uid="uid://71itkcthmqh2" path="res://open_cv_processor.gd" id="2_nwih5"]
+[ext_resource type="Script" uid="uid://c0118do55uofq" path="res://tcp_debug_stream.gd" id="3_tcpds"]
+[ext_resource type="Script" uid="uid://bqx4n7dtke5vm" path="res://detection_diagnostics.gd" id="4_diagn"]
 
 [node name="XROrigin3D" type="XROrigin3D" unique_id=1743576496]
 
@@ -15,10 +17,15 @@ script = ExtResource("1_2fw1a")
 [node name="OpenCVProcessor" type="OpenCVProcessor" parent="." unique_id=1900282744]
 lens_rotation_raw = Quaternion(-0.9951163, -0.0028897487, 0.0037281485, 0.098596975)
 lens_translation = Vector3(-0.03352603, -0.017866991, -0.058882877)
-aruco_patch_sizes = PackedFloat64Array(0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
+aruco_patch_sizes = PackedFloat64Array(0.074, 0.066, 0.066, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
 script = ExtResource("2_nwih5")
-use_xr_locate_space = false
-tcp_stream_enabled = true
+
+[node name="TcpDebugStream" type="Node" parent="OpenCVProcessor" unique_id=1900282746]
+script = ExtResource("3_tcpds")
+enabled = true
+
+[node name="DetectionDiagnostics" type="Node" parent="OpenCVProcessor" unique_id=1900282747]
+script = ExtResource("4_diagn")
 
 [node name="Patches" type="Node3D" parent="." unique_id=1900282745]
 

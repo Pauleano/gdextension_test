@@ -40,8 +40,20 @@ __pycache__/
 # Recreate with: py -3 -m venv .venv && ./.venv/Scripts/python.exe -m pip install -r tools/requirements.txt
 .venv/
 
-# Debug captures written by tools/tcp_receiver.py -- per-session measurement data, not source
-tools/images/
+# Debug captures written by tools/tcp_receiver.py (and pulled off the headset) are TRACKED, not
+# ignored: tools/saved_from_stream/, tools/reproj_logs/, tools/marker_poses/, tools/handeye_samples/.
+# These four replace the old tools/images/ dump, which held all of it plus the calibration frames.
+#
+# They are measurement data rather than source, and the usual reason to ignore that is exactly why
+# they are kept here instead: every calibration number in src/OpenCVProcessor.h was derived from one
+# of these captures, and a value whose evidence has been deleted cannot be re-checked, only
+# re-measured. The .gitkeep files stay so the layout survives an empty checkout.
+#
+# What that costs, and it is worth knowing before a long session: each capture adds its bytes to
+# history permanently. The frames are ~80 KB each and the plot PNGs ~100-800 KB, so a session that
+# streams a hundred stills is a ~10 MB commit. Prune what you did not learn anything from BEFORE
+# committing -- the plots in particular are regenerable from the CSV beside them by re-running the
+# plot script, so a figure is only worth keeping if it is the one being pointed at.
 
 .sconsign*.dblite
 

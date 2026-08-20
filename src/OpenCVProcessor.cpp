@@ -2,7 +2,6 @@
 #include "aruco_nano.h" //header-only ArucoNano detector; see the forward decl in OpenCVProcessor.h
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <opencv2/opencv.hpp> //solvepnp should be inside of calib3d module which is inside opencv
-#include <godot_cpp/classes/project_settings.hpp> //to convert path starting from res: to global path
 #include <godot_cpp/classes/engine.hpp> //is_editor_hint(): der Knoten liegt in der Szene, der Editor baut ihn mit
 #include <algorithm> //std::clamp for the downscale parameter
 //#include <godot_cpp/variant/transform3d.hpp> wird momentan nicht benötigt, da es von wo anders anscheinend schon reingezogen wird
@@ -31,17 +30,18 @@ bool OpenCVProcessor::debug_prints_enabled = false;
     UtilityFunctions::printerr("[opencv_aruco] [OpenCVProcessor::", __func__, "] ", __VA_ARGS__)
 
 void OpenCVProcessor::_bind_methods() {
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_picture", "res_path"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture);
-    ClassDB::bind_method(D_METHOD("get_6dof_of_all_aruco_patches_from_webcam", "marker_size"), &OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam);
     ClassDB::bind_method(D_METHOD("detect_markers", "image", "head_pose", "corners_out"), &OpenCVProcessor::detect_markers);
     ClassDB::bind_method(D_METHOD("get_marker_size", "id"), &OpenCVProcessor::get_marker_size);
     ClassDB::bind_method(D_METHOD("get_lens_pose"), &OpenCVProcessor::get_lens_pose);
     ClassDB::bind_method(D_METHOD("project_marker_corners", "world_poses", "head_pose"), &OpenCVProcessor::project_marker_corners);
-    //statisch gebunden, damit GDScript es setzen kann, BEVOR initialize() laeuft -- der Knoten
-    //selbst wird schon beim Instanziieren der Szene gebaut, also lange vor jedem Property und
-    //jedem _ready (siehe initialize()).
+    //statisch gebunden, damit GDScript es setzen kann, BEVOR dump_build_info_and_intrinsics()
+    //laeuft -- der Knoten selbst wird schon beim Instanziieren der Szene gebaut, also lange vor
+    //jedem Property und jedem _ready (siehe dump_build_info_and_intrinsics()).
     ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("set_debug_prints_enabled", "enabled"), &OpenCVProcessor::set_debug_prints_enabled);
-    ClassDB::bind_method(D_METHOD("initialize"), &OpenCVProcessor::initialize);
+    //Ebenfalls statisch: die Diagnose-Kindknoten lesen das Flag hierueber, statt es als Property vom
+    //Host-Skript zurueckzulesen -- siehe die Begruendung am Getter im Header.
+    ClassDB::bind_static_method("OpenCVProcessor", D_METHOD("get_debug_prints_enabled"), &OpenCVProcessor::get_debug_prints_enabled);
+    ClassDB::bind_method(D_METHOD("dump_build_info_and_intrinsics"), &OpenCVProcessor::dump_build_info_and_intrinsics);
 
     ADD_SIGNAL(MethodInfo("marker_pose_found", PropertyInfo(Variant::TRANSFORM3D, "pose")));
 
@@ -110,8 +110,8 @@ void OpenCVProcessor::rebuild_distortion() {
         distort_mat = cv::Mat();
         return;
     }
-    distort_mat = cv::Mat(n, 1, CV_32F);
     const double *dp = camera_distortion.ptr();
+    distort_mat = cv::Mat(n, 1, CV_32F);
     for (int j = 0; j < n; ++j) {
         distort_mat.at<float>(j) = (float)dp[j];
     }
@@ -172,11 +172,16 @@ void OpenCVProcessor::set_debug_prints_enabled(bool p_enabled) {
     debug_prints_enabled = p_enabled;
 }
 
+bool OpenCVProcessor::get_debug_prints_enabled() {
+    return debug_prints_enabled;
+}
+
 //Der Konstruktor MUSS still bleiben. Seit die Klasse ein in der Szene angelegter Knoten ist (statt
 //per OpenCVProcessor.new() aus _ready erzeugt), laeuft er beim Instanziieren der Szene: PackedScene
 //baut den Knoten und setzt ERST DANACH die Properties, und ueber uns haengt kein Skript mehr, das
 //das Flag frueher setzen koennte. Alles, was ausgibt oder auf Geraete zugreift, steht darum in
-//initialize() -- das GDScript eine Zeile nach set_debug_prints_enabled() aufruft.
+//dump_build_info_and_intrinsics() -- das GDScript eine Zeile nach set_debug_prints_enabled()
+//aufruft.
 //Der Detektor selbst bleibt hier: er gibt nichts aus und muss vor dem ersten Aufruf stehen.
 OpenCVProcessor::OpenCVProcessor() {
 
@@ -202,12 +207,14 @@ OpenCVProcessor::OpenCVProcessor() {
     //Defaults der Packed-Arrays: die haben keinen Inline-Initialisierer im Header. Godot liest die
     //Property-Defaults, indem es die Klasse einmal instanziiert -- was hier steht, ist also genau
     //das, was der Inspector als "unveraendert" ansieht.
+    //distCoeffs in OpenCV-Reihenfolge (k1, k2, p1, p2, k3), aus DEMSELBEN Lauf wie der Default von
+    //camera_intrinsics im Header -- siehe dort, warum die beiden nur gemeinsam ersetzt werden.
     camera_distortion = PackedFloat64Array();
-    camera_distortion.push_back(-0.00993192);
-    camera_distortion.push_back(0.11168738);
-    camera_distortion.push_back(0.00062258);
-    camera_distortion.push_back(0.00113467);
-    camera_distortion.push_back(-0.23033717);
+    camera_distortion.push_back(-0.00323431);
+    camera_distortion.push_back(0.02542156);
+    camera_distortion.push_back(-0.00016776);
+    camera_distortion.push_back(0.00090852);
+    camera_distortion.push_back(-0.02965119);
     aruco_patch_sizes = PackedFloat64Array();
     for (int i = 0; i < 10; ++i) {
         aruco_patch_sizes.push_back(0.05);
@@ -222,28 +229,34 @@ OpenCVProcessor::~OpenCVProcessor() {}
 
 //Der redselige Teil des frueheren Konstruktors, aus GDScript aufgerufen, NACHDEM
 //set_debug_prints_enabled() gelaufen ist -- nur so laesst sich der Build-Info-Dump ueberhaupt noch
-//abschalten (siehe Konstruktor). Idempotent, damit ein zweiter Aufruf (Szene neu geladen, Skript
-//umgebaut) nicht ein zweites Mal die Kamera-Metadaten liest.
-void OpenCVProcessor::initialize() {
+//abschalten (siehe Konstruktor). Der Name sagt genau, was passiert: geloggt wird die
+//OpenCV-Buildkonfiguration und (auf Android) die Kamera-Metadaten der Quest, mehr nicht -- die
+//Detektion laeuft auch ohne diesen Aufruf. Idempotent, damit ein zweiter Aufruf (Szene neu geladen,
+//Skript umgebaut) nicht ein zweites Mal die Kamera-Metadaten liest.
+void OpenCVProcessor::dump_build_info_and_intrinsics() {
     //Im Editor nur zurueckhalten: die Szene enthaelt den Knoten, also baut der Editor ihn bei jedem
     //Oeffnen mit. Der Build-Info-Dump gehoert nicht ins Editor-Ausgabefenster, und die Quest-
-    //Kameras gibt es auf dem Entwicklungsrechner ohnehin nicht. VOR dem initialized-Flag, damit ein
-    //Abbruch im Editor den einmaligen Lauf nicht verbraucht.
+    //Kameras gibt es auf dem Entwicklungsrechner ohnehin nicht. VOR dem build_info_dumped-Flag,
+    //damit ein Abbruch im Editor den einmaligen Lauf nicht verbraucht.
     if (Engine::get_singleton()->is_editor_hint()) {
         return;
     }
-    if (initialized) {
+    if (build_info_dumped) {
         return;
     }
-    initialized = true;
+    build_info_dumped = true;
 
     ACV_DBG("opencv build information:\n", String(cv::getBuildInformation().c_str())); // Full build configuration.
 
-    init_quest_intrinsics();
+    dump_quest_camera_metadata();
 }
 
 
-void OpenCVProcessor::init_quest_intrinsics() {
+//Reiner Dump: liest die Camera2-Metadaten der beiden Passthrough-Kameras ("50"/"51") und loggt sie.
+//Was hier in K_cam50/K_cam51/D landet, benutzt die Detektion NICHT -- sie rechnet mit den
+//Inspector-Properties -- und die geloggte Linsenpose ist gyro-referenziert, siehe die Warnung an
+//lens_rotation_raw im Header. Das ist der Grund fuer den Namen: hier wird nichts initialisiert.
+void OpenCVProcessor::dump_quest_camera_metadata() {
 
     ACV_DBG("called");
     #ifdef __ANDROID__
@@ -367,80 +380,20 @@ void OpenCVProcessor::init_quest_intrinsics() {
     #endif
 }
 
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const String &res_path) {
-    Dictionary result;
-
-    String global_path = ProjectSettings::get_singleton()->globalize_path(res_path);
-    std::string path_std = global_path.utf8().get_data();
-    cv::Mat image = cv::imread(path_std);
-    if (image.empty()) {
-        ACV_ERR("could not load image: ", global_path);
-        return result;
-    }
-
-    float half = 0.05f / 2.0f;
-    std::vector<cv::Point3f> obj_pts = {
-        {-half,  half, 0.0f},
-        { half,  half, 0.0f},
-        { half, -half, 0.0f},
-        {-half, -half, 0.0f}
-    };
-
-    float w = static_cast<float>(image.cols);
-    float h = static_cast<float>(image.rows);
-
-    cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
-        w, 0, w/2.0f,
-        0, w, h/2.0f,
-        0, 0, 1);
-    cv::Mat distort = cv::Mat::zeros(5, 1, CV_32F);
-
-    std::vector<std::vector<cv::Point2f>> corners;
-    std::vector<int> ids;
-    detector->detectMarkers(image, corners, ids);
-
-    if (ids.empty()) {
-        //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
-        ACV_DBG("kein Marker erkannt");
-        return result;
-    }
-
-    for (size_t i = 0; i < ids.size(); ++i) {
-        cv::Mat rvec, tvec;
-        bool ok2 = cv::solvePnP(
-            obj_pts, corners[i], Kamera_matrix, distort,
-            rvec, tvec,
-            false,
-            cv::SOLVEPNP_IPPE_SQUARE);
-        if (!ok2) {
-            continue;
-        }
-
-        cv::Mat rot_matrix;
-        cv::Rodrigues(rvec, rot_matrix);
-
-        Basis basis(
-            Vector3(rot_matrix.at<double>(0,0), -rot_matrix.at<double>(1,0), -rot_matrix.at<double>(2,0)),
-            Vector3(-rot_matrix.at<double>(0,1), rot_matrix.at<double>(1,1), rot_matrix.at<double>(2,1)),
-            Vector3(-rot_matrix.at<double>(0,2), rot_matrix.at<double>(1,2), rot_matrix.at<double>(2,2))
-        );
-
-        Vector3 origin(
-            ( tvec.at<double>(0)),
-            (-tvec.at<double>(1)),
-            (-tvec.at<double>(2))
-        );
-
-        result[ids[i]] = Transform3D(basis, origin);
-    }
-
-    return result;
-}
-
-//shared detect+solvePnP pipeline; frame may be gray (1ch) or BGR (3ch). Everything it needs beyond
-//the pixels and the head pose is a property (see the header): per-id marker sizes, intrinsics,
-//distortion, downscale, lens pose. Same OpenCV->Godot change of basis as the picture/webcam
-//variants above.
+//Die detect+solvePnP-Pipeline. Alles ausser den Pixeln und der Kopfpose ist eine Property (siehe
+//Header): Marker-Groessen pro id, Intrinsics, Verzeichnung, Downscale, lens_pose.
+//frame ist GRAUSTUFEN (1ch) -- detect_markers wandelt jedes Eingabeformat vorher um, und seit die
+//alten Einstiegspunkte weg sind, ist detect_markers der einzige Aufrufer. (Der frueher hier
+//dokumentierte BGR-Fall kam von der geloeschten Webcam-Funktion, die cap.read() direkt
+//weiterreichte; detectMarkers wuerde 3ch zwar annehmen, aber niemand fuettert es mehr so.)
+//Seit die beiden alten Einstiegspunkte (imread-Bild, cv::VideoCapture-Webcam) geloescht sind, ist
+//dies die EINZIGE Stelle mit dem OpenCV->Godot-Basiswechsel. Vorher stand derselbe Block dreimal
+//im File, also drei Stellen, an denen ein Vorzeichen kippen konnte -- an der fehleranfaelligsten
+//Stelle des Projekts ueberhaupt (siehe die Konventions-Kommentare im Header).
+//Wer eine Offline-Variante ueber ein Bild von der Platte braucht: hier mit identity head_pose
+//hereinreichen. Das ist BESSER als die geloeschte Bild-Funktion, nicht bloss ein Ersatz -- die
+//rechnete mit erfundenen Intrinsics (fx=fy=Bildbreite, Hauptpunkt in der Mitte) und ohne
+//Verzeichnung, also mit einer Kamera, die es nicht gibt; hier laufen die kalibrierten Werte.
 Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose, Dictionary &corners_out) {
     Dictionary result;
 
@@ -481,10 +434,14 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
     // two can never disagree. (GDScript used to scale them with the unclamped value and hand the
     // result in; an out-of-range factor silently produced a camera matrix for a frame size that was
     // never rendered.)
-    const float fx = (float)camera_intrinsics.x * DETECT_DOWNSCALE;
-    const float fy = (float)camera_intrinsics.y * DETECT_DOWNSCALE;
-    const float cx = (float)camera_intrinsics.z * DETECT_DOWNSCALE;
-    const float cy = (float)camera_intrinsics.w * DETECT_DOWNSCALE;
+    // EINMAL in eine lokale Kopie lesen: der (Remote-)Inspector schreibt camera_intrinsics auf dem
+    // Hauptthread, waehrend diese Detektion im Worker laeuft -- vier getrennte Zugriffe koennten
+    // dann zwei Kalibrierungen mischen.
+    const Vector4 K_active = camera_intrinsics;
+    const float fx = (float)K_active.x * DETECT_DOWNSCALE;
+    const float fy = (float)K_active.y * DETECT_DOWNSCALE;
+    const float cx = (float)K_active.z * DETECT_DOWNSCALE;
+    const float cy = (float)K_active.w * DETECT_DOWNSCALE;
 
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         fx, 0, cx,
@@ -597,9 +554,12 @@ Dictionary OpenCVProcessor::project_marker_corners(Dictionary world_poses, const
     //existiert nur, um die Detektion billiger zu machen. Diese Pixel werden gegen die Ecken
     //verglichen, die detect_and_solve_all oben schon wieder aus dem Detektionsframe herausgeteilt
     //hat -- beide leben also im Pixelraum des ORIGINALBILDS, das der Streamer verschickt.
+    //Dieselbe Property wie in der Detektion -- sonst pruefte das rote Overlay eine andere Kamera
+    //als die gruenen Ecken, gegen die es gezeichnet wird.
+    const Vector4 K_active = camera_intrinsics;
     cv::Mat K = (cv::Mat_<double>(3, 3) <<
-        camera_intrinsics.x, 0.0, camera_intrinsics.z,
-        0.0, camera_intrinsics.y, camera_intrinsics.w,
+        K_active.x, 0.0, K_active.z,
+        0.0, K_active.y, K_active.w,
         0.0, 0.0, 1.0);
 
     const Transform3D world_to_cam = (head_pose * lens_pose).affine_inverse();
@@ -698,80 +658,4 @@ Dictionary OpenCVProcessor::detect_markers(const Ref<Image> &image, const Transf
     // the distortion Mat in particular is built once in its setter instead of being rebuilt out of
     // a PackedFloat64Array on every single frame.
     return detect_and_solve_all(gray, head_pose, corners_out);
-}
-
-Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const float &marker_size) {
-    Dictionary result;
-
-    if (!cap.isOpened()) {
-        cap.open(0, cv::CAP_DSHOW);
-        if (!cap.isOpened()) {
-            ACV_ERR("could not open webcam");
-            return result;
-        }
-    }
-
-    cv::Mat frame;
-    if (!cap.read(frame) || frame.empty()) {
-        ACV_ERR("could not read frame from webcam");
-        return result;
-    }
-
-    float half = marker_size / 2.0f;
-    std::vector<cv::Point3f> obj_pts = {
-        {-half,  half, 0.0f},
-        { half,  half, 0.0f},
-        { half, -half, 0.0f},
-        {-half, -half, 0.0f}
-    };
-
-    float w = static_cast<float>(frame.cols);
-    float h = static_cast<float>(frame.rows);
-
-    cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
-        w, 0, w/2.0f,
-        0, w, h/2.0f,
-        0, 0, 1);
-    cv::Mat distort = cv::Mat::zeros(5, 1, CV_32F);
-
-    std::vector<std::vector<cv::Point2f>> corners;
-    std::vector<int> ids;
-    detector->detectMarkers(frame, corners, ids);
-
-    if (ids.empty()) {
-        //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
-        ACV_DBG("kein Marker erkannt");
-        return result;
-    }
-
-    for (size_t i = 0; i < ids.size(); ++i) {
-        cv::Mat rvec, tvec;
-        bool ok2 = cv::solvePnP(
-            obj_pts, corners[i], Kamera_matrix, distort,
-            rvec, tvec,
-            false,
-            cv::SOLVEPNP_IPPE_SQUARE);
-        if (!ok2) {
-            continue;
-        }
-
-        cv::Mat rot_matrix;
-        cv::Rodrigues(rvec, rot_matrix);
-
-        Basis basis(
-            Vector3(rot_matrix.at<double>(0,0), -rot_matrix.at<double>(1,0), -rot_matrix.at<double>(2,0)),
-            Vector3(-rot_matrix.at<double>(0,1), rot_matrix.at<double>(1,1), rot_matrix.at<double>(2,1)),
-            Vector3(-rot_matrix.at<double>(0,2), rot_matrix.at<double>(1,2), rot_matrix.at<double>(2,2))
-        );
-
-        Vector3 origin(
-            ( tvec.at<double>(0)),
-            (-tvec.at<double>(1)),
-            (-tvec.at<double>(2))
-        );
-
-        result[ids[i]] = Transform3D(basis, origin);
-    }
-
-    return result;
 }

@@ -25,10 +25,15 @@ localEnv = Environment(tools=["default"], PLATFORM="")
 customs = ["custom.py"]
 customs = [os.path.abspath(path) for path in customs]
 
-# Camera2 NDK (libcamera2ndk/libmediandk, needed by OpenCV's videoio Android backend) only
-# exists in the NDK sysroot from API 24+. godot-cpp defaults android_api_level to 21, where
-# linking fails with "-lcamera2ndk". Pin it to 24 for android builds (matches the Conan
-# android profile's os.api_level). Explicit android_api_level=... on the CLI still wins.
+# Camera2 NDK (libcamera2ndk) only exists in the NDK sysroot from API 24+. godot-cpp defaults
+# android_api_level to 21, where linking fails with "-lcamera2ndk". Pin it to 24 for android
+# builds (matches the Conan android profile's os.api_level). Explicit android_api_level=... on
+# the CLI still wins.
+# WER braucht das: frueher OpenCVs videoio-Android-Backend, aber die einzigen Aufrufer von
+# videoio (die alten Bild-/Webcam-Einstiegspunkte) sind geloescht. Load-bearing ist jetzt
+# dump_quest_camera_metadata() in OpenCVProcessor.cpp, das ACameraManager_* direkt aufruft --
+# also bleibt der Pin, nur der Grund hat gewechselt. Faellt dieser Dump je weg, ist API 24
+# vermutlich frei (dann auch conanfile.py: opencv videoio=True pruefen).
 if ARGUMENTS.get("platform") == "android":
     ARGUMENTS.setdefault("android_api_level", "24")
 
@@ -163,9 +168,19 @@ elif env["platform"] == "android":
         subprocess.run([ensure_conan(), "install", ".", "--output-folder", conan_out,
                         "--build=missing", "-pr:h", host_profile], check=True)
     merge_conan_deps(env, conan_out)
-    # OpenCV's videoio Android backend references the Camera2 NDK (libcamera2ndk/libmediandk);
-    # without these the .so fails to load on device with "undefined symbol ACameraManager_create".
-    env.Append(LIBS=["camera2ndk", "mediandk", "android", "log"])
+    # camera2ndk ist hier LOAD-BEARING und steht in keiner Conan-Liste: dump_quest_camera_metadata()
+    # ruft ACameraManager_*/ACameraMetadata_* direkt auf, ohne dieses -l scheitert das Laden auf dem
+    # Geraet mit "undefined symbol ACameraManager_create".
+    # mediandk stand hier frueher daneben, ist aber ein DUPLIKAT: Conans opencv-Paket fuehrt es in
+    # seinem cpp_info (wegen des videoio-Android-Backends), und merge_conan_deps() oben merged das
+    # ohnehin in env["LIBS"]. Darum hier raus -- am fertigen .so aendert das nichts, libmediandk.so
+    # bleibt ueber Conan ein DT_NEEDED.
+    # GEMESSEN am fertigen .so (llvm-readelf --dyn-syms): von 307 undefinierten Symbolen sind genau
+    # 7 NDK-Kamera-Symbole, alle ACamera*, KEIN einziges AMedia*/AImage*. libmediandk wird also
+    # verlinkt, ohne dass ein Symbol daraus gebraucht wird. Der Hebel dagegen ist nicht diese Zeile,
+    # sondern "opencv/*:videoio" in conanfile.py -- seit die Webcam-Funktion geloescht ist, benutzt
+    # nichts mehr videoio (kostet aber einen kompletten OpenCV-Rebuild, siehe dort).
+    env.Append(LIBS=["camera2ndk", "android", "log"])
     library = env.SharedLibrary(  # libopencv_aruco.android.<target>[.double].<arch>.so
         "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
