@@ -22,7 +22,6 @@ script = ExtResource("2_nwih5")
 
 [node name="TcpDebugStream" type="Node" parent="OpenCVProcessor" unique_id=1900282746]
 script = ExtResource("3_tcpds")
-enabled = true
 
 [node name="DetectionDiagnostics" type="Node" parent="OpenCVProcessor" unique_id=1900282747]
 script = ExtResource("4_diagn")
